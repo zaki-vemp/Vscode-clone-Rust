@@ -1,0 +1,27 @@
+[package]
+name = "oxide-code"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "OxideCode - a pure-Rust native desktop code editor (macOS, Linux, Windows)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "oxide-code"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.32"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[profile.dev]
+opt-level = 1

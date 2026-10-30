@@ -1,8 +1,6 @@
-node_modules/
-build/
-dist/
-coverage/
+/target/
+*.swp
+*~
 .DS_Store
-*.log
-.env*
-!.env.example
+Thumbs.db
+oxide-backups/
