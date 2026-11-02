@@ -1,0 +1,81 @@
+{
+  "method": "release ignored tests; 5 samples per scanner size, sequential; Rust drops instead of GC",
+  "machine": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "metrics": [
+    {
+      "case": "minified_strings",
+      "entries": 1000,
+      "bytes": 14001,
+      "median_us": 28722,
+      "samples_us": [
+        17562,
+        28407,
+        28722,
+        28903,
+        29113
+      ]
+    },
+    {
+      "case": "minified_strings",
+      "entries": 2000,
+      "bytes": 28001,
+      "median_us": 113352,
+      "samples_us": [
+        113263,
+        113266,
+        113352,
+        113894,
+        116012
+      ]
+    },
+    {
+      "case": "minified_strings",
+      "entries": 4000,
+      "bytes": 56001,
+      "median_us": 448968,
+      "samples_us": [
+        337342,
+        447695,
+        448968,
+        450340,
+        451903
+      ]
+    },
+    {
+      "case": "output_retention",
+      "phase": "warmup",
+      "rss_kib": 7480,
+      "retained_bytes": 2097152,
+      "lines": 32
+    },
+    {
+      "case": "output_retention",
+      "phase": "N=200",
+      "rss_kib": 20280,
+      "retained_bytes": 15204352,
+      "lines": 232
+    },
+    {
+      "case": "output_retention",
+      "phase": "2N=400",
+      "rss_kib": 33100,
+      "retained_bytes": 28311552,
+      "lines": 432
+    },
+    {
+      "case": "output_retention",
+      "phase": "3N=600",
+      "rss_kib": 45928,
+      "retained_bytes": 41418752,
+      "lines": 632
+    },
+    {
+      "case": "output_retention",
+      "phase": "cleared",
+      "rss_kib": 38436,
+      "retained_bytes": 0,
+      "lines": 0
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "tool": "Gitleaks 8.30.1",
+  "checksum_verified": true,
+  "redaction": "100%",
+  "results": [
+    {
+      "mode": "git",
+      "exit_code": 0,
+      "findings": []
+    },
+    {
+      "mode": "dir",
+      "exit_code": 0,
+      "findings": []
+    },
+    {
+      "mode": "dir-final",
+      "exit_code": 0,
+      "findings": []
+    }
+  ],
+  "limits": "2 MiB per file; dir uses isolated source snapshot without session metadata/build outputs"
+}

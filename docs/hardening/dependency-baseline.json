@@ -1,0 +1,67 @@
+{
+  "packages_queried": 466,
+  "findings": [
+    {
+      "name": "paste",
+      "version": "1.0.15",
+      "advisories": [
+        "RUSTSEC-2024-0436"
+      ]
+    },
+    {
+      "name": "quick-xml",
+      "version": "0.31.0",
+      "advisories": [
+        "RUSTSEC-2026-0194",
+        "RUSTSEC-2026-0195"
+      ]
+    },
+    {
+      "name": "rustybuzz",
+      "version": "0.20.1",
+      "advisories": [
+        "RUSTSEC-2026-0206"
+      ]
+    },
+    {
+      "name": "ttf-parser",
+      "version": "0.25.1",
+      "advisories": [
+        "RUSTSEC-2026-0192"
+      ]
+    },
+    {
+      "name": "zbus_names",
+      "version": "4.3.5",
+      "advisories": [
+        "RUSTSEC-2026-0371"
+      ]
+    },
+    {
+      "name": "zip",
+      "version": "2.4.2",
+      "advisories": [
+        "GHSA-8hxf-qr8p-62x4",
+        "GHSA-m665-v7pm-7grj",
+        "GHSA-q7v9-x93c-xqv3",
+        "RUSTSEC-2026-0367",
+        "RUSTSEC-2026-0368",
+        "RUSTSEC-2026-0369"
+      ]
+    },
+    {
+      "name": "zvariant",
+      "version": "5.15.1",
+      "advisories": [
+        "RUSTSEC-2026-0370"
+      ]
+    },
+    {
+      "name": "zvariant_derive",
+      "version": "5.15.1",
+      "advisories": [
+        "RUSTSEC-2026-0372"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "method": "five fresh CLI processes after one warmup per fixture; same generated files on same host",
+  "binary_sha256": "ba10af0521a90764f93b700d054a71b01b143a72e481392d0c0024f195a56e1a",
+  "metrics": [
+    {
+      "file": "workspace.csv",
+      "median_ms": 1.679,
+      "samples_ms": [
+        3.412,
+        1.952,
+        1.679,
+        1.623,
+        1.572
+      ]
+    },
+    {
+      "file": "workbook.xlsx",
+      "median_ms": 1.934,
+      "samples_ms": [
+        1.975,
+        1.879,
+        1.934,
+        1.973,
+        1.924
+      ]
+    },
+    {
+      "file": "gradient.png",
+      "median_ms": 13.192,
+      "samples_ms": [
+        16.937,
+        16.664,
+        8.307,
+        13.192,
+        6.803
+      ]
+    },
+    {
+      "file": "document.docx",
+      "median_ms": 1.659,
+      "samples_ms": [
+        1.659,
+        1.719,
+        1.767,
+        1.658,
+        1.655
+      ]
+    }
+  ]
+}

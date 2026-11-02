@@ -3,6 +3,7 @@ name: build
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -12,45 +13,64 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libssl-dev
-
+          sudo apt-get install -y build-essential pkg-config dpkg-dev \
+            libx11-dev libxi-dev libgl1-mesa-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libwayland-dev libssl-dev
+      - name: Secret scan (pinned Gitleaks)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location --retry 2 --max-time 60 \
+            'https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz' -o /tmp/gitleaks.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz' | sha256sum --check
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks git --redact=100 --no-banner --timeout 60 .
+          /tmp/gitleaks dir --redact=100 --no-banner --timeout 60 .
+      - name: Advisory policy tests
+        run: python -m unittest scripts.test_dependency_audit
+      - name: Dependency security review gate
+        if: runner.os == 'Linux'
+        run: python scripts/dependency_audit.py --output dependency-audit.json
       - name: Format check
         run: cargo fmt --check
-
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Tests
-        run: cargo test
-
+        run: cargo test --locked
       - name: Release build
-        run: cargo build --release
-
-      - name: Upload binary (Linux/macOS)
-        if: runner.os != 'Windows'
+        run: cargo build --release --locked
+      - name: Native preview smoke checks
+        run: python scripts/preview_smoke.py --binary target/release/oxide-code
+      - name: Package
+        run: python scripts/package.py --no-build
+      - name: Debian package and verification
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python scripts/package.py --format deb --no-build
+          python scripts/check_deb.py dist/*.deb
+      - name: Upload native package and checksum
         uses: actions/upload-artifact@v4
         with:
-          name: oxide-code-${{ runner.os }}
-          path: target/release/oxide-code
-
-      - name: Upload binary (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: oxide-code-Windows
-          path: target/release/oxide-code.exe
+          name: oxide-code-${{ runner.os }}-${{ runner.arch }}
+          if-no-files-found: error
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*.sha256

@@ -10,6 +10,8 @@
 pub struct TextBuffer {
     lines: Vec<String>,
     saved: Vec<String>,
+    revision: u64,
+    dirty: bool,
 }
 
 impl TextBuffer {
@@ -19,6 +21,8 @@ impl TextBuffer {
         Self {
             saved: lines.clone(),
             lines,
+            revision: 0,
+            dirty: false,
         }
     }
 
@@ -34,28 +38,37 @@ impl TextBuffer {
         self.lines.len()
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Full current text with `\n` separators (no trailing newline added).
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.lines != self.saved
+        self.dirty
     }
 
     /// Replace the whole live content (used when the UI editor commits a change).
     pub fn set_text(&mut self, text: &str) {
         self.lines = split_lines(text);
+        self.dirty = self.lines != self.saved;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Mark the current content as saved (after a successful write to disk).
     pub fn mark_saved(&mut self) {
         self.saved = self.lines.clone();
+        self.dirty = false;
     }
 
     /// Revert live content to the last saved snapshot.
     pub fn revert(&mut self) {
         self.lines = self.saved.clone();
+        self.dirty = false;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Convert a char offset (as reported by egui cursors) to 0-based (line, col).

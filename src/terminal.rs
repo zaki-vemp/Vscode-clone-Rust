@@ -3,10 +3,17 @@
 //! `clear`) matching the `.aistudio` showcase.
 
 use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
+
+const MAX_LINES: usize = 5_000;
+const MAX_LINE_BYTES: usize = 16 * 1024;
+const MAX_HISTORY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_QUEUED_LINES: usize = 128;
+const TRUNCATED: &str = " … [line truncated]";
 
 /// One printed line in the terminal panel.
 #[derive(Clone, Debug)]
@@ -16,6 +23,7 @@ pub struct TermLine {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum TermKind {
     Input,
     Output,
@@ -27,22 +35,20 @@ pub enum TermKind {
 /// Background command runner feeding the terminal panel.
 pub struct Terminal {
     lines: VecDeque<TermLine>,
+    retained_bytes: usize,
     rx: Option<Receiver<TermLine>>,
     busy: bool,
     cwd: PathBuf,
-    pub history: Vec<String>,
-    pub history_idx: Option<usize>,
 }
 
 impl Terminal {
     pub fn new(cwd: PathBuf) -> Self {
         let mut t = Self {
             lines: VecDeque::new(),
+            retained_bytes: 0,
             rx: None,
             busy: false,
             cwd,
-            history: Vec::new(),
-            history_idx: None,
         };
         t.reset_banner();
         t
@@ -50,18 +56,7 @@ impl Terminal {
 
     pub fn reset_banner(&mut self) {
         self.lines.clear();
-        self.push(
-            TermKind::Info,
-            "🦀 OxideCode Rust Terminal Host v0.1.0 (wgpu native engine)",
-        );
-        self.push(
-            TermKind::Success,
-            "✓ Rust toolchain initialized: rustc 1.82.0 (x86_64-unknown-linux-gnu)",
-        );
-        self.push(
-            TermKind::Output,
-            "Type \"help\" for cargo commands, or run \"bench\" to compare Rust vs Electron.",
-        );
+        self.retained_bytes = 0;
     }
 
     pub fn set_cwd(&mut self, cwd: PathBuf) {
@@ -81,15 +76,22 @@ impl Terminal {
         &self.lines
     }
 
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.retained_bytes = 0;
     }
 
     pub fn push(&mut self, kind: TermKind, text: impl Into<String>) {
-        let text = text.into();
-        while self.lines.len() > 5000 {
-            self.lines.pop_front();
+        let text = bounded_text(text.into());
+        while self.lines.len() >= MAX_LINES || self.retained_bytes + text.len() > MAX_HISTORY_BYTES
+        {
+            let Some(line) = self.lines.pop_front() else {
+                break;
+            };
+            self.retained_bytes -= line.text.len();
         }
+        self.retained_bytes += text.len();
         self.lines.push_back(TermLine { kind, text });
     }
 
@@ -99,172 +101,90 @@ impl Terminal {
             self.push(TermKind::Error, "a command is already running");
             return;
         }
-        let echo = format!("[oxide-editor] ~/dev/oxide-editor (main) $ {} {}", program, args.join(" "));
+        let echo = format!("{} $ {} {}", cwd.display(), program, args.join(" "));
         self.push(TermKind::Input, echo);
         self.cwd = cwd.to_path_buf();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MAX_QUEUED_LINES);
         self.rx = Some(rx);
         self.busy = true;
         let program = program.to_string();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let cwd = cwd.to_path_buf();
         thread::spawn(move || {
-            let send = |kind, text: String| {
-                let _ = tx.send(TermLine { kind, text });
-            };
-            match Command::new(&program)
+            let mut child = match Command::new(&program)
                 .args(&args)
                 .current_dir(&cwd)
-                .output()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
             {
-                Err(e) => send(TermKind::Error, format!("failed to start `{program}`: {e}")),
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    for line in stdout.lines() {
-                        send(TermKind::Output, line.to_string());
-                    }
-                    for line in stderr.lines() {
-                        send(TermKind::Error, line.to_string());
-                    }
-                    if out.status.success() {
-                        send(
-                            TermKind::Success,
-                            format!("✓ Finished `{program}` ({})", out.status),
-                        );
-                    } else {
-                        send(
-                            TermKind::Error,
-                            format!("process exited with {}", out.status),
-                        );
-                    }
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = tx.send(TermLine {
+                        kind: TermKind::Error,
+                        text: format!("failed to start `{program}`: {error}"),
+                    });
+                    return;
                 }
-            }
+            };
+            let stdout = child.stdout.take().expect("piped stdout");
+            let stderr = child.stderr.take().expect("piped stderr");
+            let output_tx = tx.clone();
+            let output = thread::spawn(move || stream_lines(stdout, TermKind::Output, &output_tx));
+            let error_tx = tx.clone();
+            let errors = thread::spawn(move || stream_lines(stderr, TermKind::Error, &error_tx));
+            let result = child.wait();
+            let _ = output.join();
+            let _ = errors.join();
+            let (kind, text) = match result {
+                Ok(status) if status.success() => (
+                    TermKind::Success,
+                    format!("✓ Finished `{program}` ({status})"),
+                ),
+                Ok(status) => (TermKind::Error, format!("process exited with {status}")),
+                Err(error) => (
+                    TermKind::Error,
+                    format!("cannot wait for `{program}`: {error}"),
+                ),
+            };
+            let _ = tx.send(TermLine { kind, text });
         });
     }
 
     /// Run free-form input through builtins (`clear`, `help`, `bench`) or the platform shell.
-    pub fn run_shell(&mut self, input: &str, cwd: &Path) {
-        let cmd = input.trim();
-        if cmd.is_empty() {
-            return;
-        }
-        self.history.push(cmd.to_string());
-        self.history_idx = None;
-        if self.busy {
-            self.push(TermKind::Error, "a command is already running");
-            return;
-        }
-        match cmd {
-            "clear" => {
-                self.clear();
-                return;
-            }
-            "help" => {
-                self.push(
-                    TermKind::Input,
-                    "[oxide-editor] ~/dev/oxide-editor (main) $ help",
-                );
-                for (kind, line) in HELP {
-                    self.push(*kind, (*line).to_string());
-                }
-                return;
-            }
-            "bench" => {
-                self.push(
-                    TermKind::Input,
-                    "[oxide-editor] ~/dev/oxide-editor (main) $ bench",
-                );
-                self.push(
-                    TermKind::Info,
-                    "=== Microbenchmark: OxideCode (Rust) vs Electron VS Code ===",
-                );
-                self.push(
-                    TermKind::Success,
-                    "Typing Key-to-Glass Latency:  OxideCode: 0.8ms   | VS Code: 24.5ms  (30x faster)",
-                );
-                self.push(
-                    TermKind::Success,
-                    "Cold Startup Time:           OxideCode: 42ms    | VS Code: 1250ms  (30x faster)",
-                );
-                self.push(
-                    TermKind::Success,
-                    "Idle RAM Consumption:        OxideCode: 22MB    | VS Code: 480MB   (22x leaner)",
-                );
-                self.push(
-                    TermKind::Success,
-                    "Frame Rate at Scroll:        OxideCode: 120 FPS | VS Code: 58 FPS  (Lossless GPU)",
-                );
-                return;
-            }
-            _ => {}
-        }
-        self.push(
-            TermKind::Input,
-            format!("[oxide-editor] ~/dev/oxide-editor (main) $ {cmd}"),
-        );
-        self.cwd = cwd.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        self.rx = Some(rx);
-        self.busy = true;
-        let cmd = cmd.to_string();
-        let cwd = cwd.to_path_buf();
-        thread::spawn(move || {
-            let send = |kind, text: String| {
-                let _ = tx.send(TermLine { kind, text });
-            };
-            #[cfg(windows)]
-            let result = Command::new("cmd")
-                .arg("/C")
-                .arg(&cmd)
-                .current_dir(&cwd)
-                .output();
-            #[cfg(not(windows))]
-            let result = Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(&cwd)
-                .output();
-            match result {
-                Err(e) => send(TermKind::Error, format!("shell failed: {e}")),
-                Ok(out) => {
-                    for line in String::from_utf8_lossy(&out.stdout).lines() {
-                        send(TermKind::Output, line.to_string());
-                    }
-                    for line in String::from_utf8_lossy(&out.stderr).lines() {
-                        send(TermKind::Error, line.to_string());
-                    }
-                    if !out.status.success() {
-                        send(TermKind::Error, format!("exit {}", out.status));
-                    }
-                }
-            }
-        });
-    }
-
-    /// Drain finished / in-flight output. Call every frame.
+    #[allow(dead_code)]
     pub fn poll(&mut self) {
-        if let Some(rx) = self.rx.take() {
-            let mut done = false;
-            for line in rx.try_iter() {
-                self.push(line.kind, line.text);
-            }
+        let Some(rx) = self.rx.take() else {
+            return;
+        };
+        // Backpressure applies to both the queue and work done in one UI frame.
+        for _ in 0..MAX_QUEUED_LINES {
             match rx.try_recv() {
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => done = true,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Ok(line) => self.push(line.kind, line.text),
-            }
-            if !done {
-                self.rx = Some(rx);
-            } else {
-                self.busy = false;
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.rx = Some(rx);
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.busy = false;
+                    return;
+                }
             }
         }
+        self.rx = Some(rx);
     }
 
     /// Blocking helper used by non-interactive callers (diagnostics refresh).
     pub fn run_blocking(program: &str, args: &[&str], cwd: &Path) -> (bool, String) {
-        match Command::new(program).args(args).current_dir(cwd).output() {
+        match crate::process::capture(
+            Command::new(program).args(args).current_dir(cwd),
+            crate::process::Limits {
+                timeout: std::time::Duration::from_secs(180),
+                stdout: 16 * 1024 * 1024,
+                stderr: 2 * 1024 * 1024,
+            },
+        ) {
             Err(e) => (false, format!("failed to start `{program}`: {e}")),
             Ok(out) => {
                 let mut text = String::new();
@@ -276,20 +196,69 @@ impl Terminal {
     }
 }
 
-const HELP: &[(TermKind, &str)] = &[
-    (TermKind::Info, "OxideCode Rust Shell v0.1.0 (wgpu native engine)"),
-    (TermKind::Output, "Available commands:"),
-    (TermKind::Output, "  cargo check           - Run fast typecheck via rust-analyzer"),
-    (TermKind::Output, "  cargo test            - Run Rust unit and integration test suite"),
-    (TermKind::Output, "  cargo clippy          - Run linter warnings and borrow checker"),
-    (TermKind::Output, "  cargo run             - Build and execute native OxideCode binary"),
-    (TermKind::Output, "  cargo build --release - Compile optimized native binary"),
-    (TermKind::Output, "  rustc --version       - Display installed Rust compiler"),
-    (TermKind::Output, "  bench                 - Run microbenchmark comparing Rust vs Electron"),
-    (TermKind::Output, "  git status            - Show working tree status"),
-    (TermKind::Output, "  git log               - Show recent commits"),
-    (TermKind::Output, "  clear                 - Clear terminal screen"),
-];
+fn bounded_text(text: String) -> String {
+    if text.len() <= MAX_LINE_BYTES {
+        return text;
+    }
+    let mut end = MAX_LINE_BYTES - TRUNCATED.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &text[..end], TRUNCATED)
+}
+
+fn stream_lines(input: impl Read, kind: TermKind, tx: &SyncSender<TermLine>) {
+    let mut reader = BufReader::new(input);
+    let mut line = Vec::with_capacity(MAX_LINE_BYTES);
+    let mut truncated = false;
+    loop {
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                let _ = tx.send(TermLine {
+                    kind: TermKind::Error,
+                    text: format!("cannot read command output: {error}"),
+                });
+                return;
+            }
+        };
+        if buffer.is_empty() {
+            if !line.is_empty() || truncated {
+                let _ = tx.send(output_line(&line, truncated, kind));
+            }
+            return;
+        }
+        let consumed = buffer.len();
+        for &byte in buffer {
+            if byte == b'\n' {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if tx.send(output_line(&line, truncated, kind)).is_err() {
+                    return;
+                }
+                line.clear();
+                truncated = false;
+            } else if line.len() < MAX_LINE_BYTES {
+                line.push(byte);
+            } else {
+                truncated = true;
+            }
+        }
+        reader.consume(consumed);
+    }
+}
+
+fn output_line(bytes: &[u8], truncated: bool, kind: TermKind) -> TermLine {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if truncated {
+        text.push_str(TRUNCATED);
+    }
+    TermLine {
+        kind,
+        text: bounded_text(text),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -300,16 +269,6 @@ mod tests {
         let (ok, text) = Terminal::run_blocking("cargo", &["--version"], Path::new("."));
         assert!(ok, "cargo should run: {text}");
         assert!(text.contains("cargo"));
-    }
-
-    #[test]
-    fn bench_builtin_outputs_comparison() {
-        let mut t = Terminal::new(PathBuf::from("."));
-        t.run_shell("bench", Path::new("."));
-        assert!(t
-            .lines()
-            .iter()
-            .any(|l| l.text.contains("Microbenchmark: OxideCode")));
     }
 
     #[test]
@@ -328,5 +287,67 @@ mod tests {
             .lines()
             .iter()
             .any(|l| matches!(l.kind, TermKind::Success)));
+    }
+    #[test]
+    #[ignore = "manual memory baseline; run with --ignored --nocapture --test-threads=1"]
+    fn hardening_measure_output_retention() {
+        let mut terminal = Terminal::new(PathBuf::from("."));
+        let sample = |phase: &str, terminal: &Terminal| {
+            let rss_kib = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find(|line| line.starts_with("VmRSS:"))
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .and_then(|value| value.parse::<u64>().ok())
+                });
+            let bytes: usize = terminal.lines.iter().map(|line| line.text.len()).sum();
+            println!(
+                "HARDENING_METRIC {}",
+                serde_json::json!({"case":"output_retention","phase":phase,"rss_kib":rss_kib,"retained_bytes":bytes,"lines":terminal.lines.len()})
+            );
+        };
+        for _ in 0..32 {
+            terminal.push(TermKind::Output, "w".repeat(65_536));
+        }
+        sample("warmup", &terminal);
+        for phase in ["N=200", "2N=400", "3N=600"] {
+            for _ in 0..200 {
+                terminal.push(TermKind::Output, "x".repeat(65_536));
+            }
+            sample(phase, &terminal);
+        }
+        terminal.clear();
+        sample("cleared", &terminal);
+    }
+    #[test]
+    fn mem_001_output_history_is_bounded_by_bytes() {
+        let mut terminal = Terminal::new(PathBuf::from("."));
+        for _ in 0..512 {
+            terminal.push(TermKind::Output, "猫".repeat(21_846));
+        }
+        let bytes: usize = terminal.lines().iter().map(|line| line.text.len()).sum();
+        assert!(bytes <= 2 * 1024 * 1024, "History retained {bytes} bytes");
+        assert!(terminal
+            .lines()
+            .iter()
+            .all(|line| line.text.len() <= 16 * 1024));
+        terminal.clear();
+        terminal.push(TermKind::Output, "still usable");
+        assert_eq!(terminal.lines().len(), 1);
+    }
+    #[test]
+    fn mem_001_streaming_handles_giant_lines_and_unicode() {
+        let mut bytes = "猫".repeat(100_000).into_bytes();
+        bytes.extend_from_slice(b"\r\nnext\n");
+        let (tx, rx) = mpsc::sync_channel(8);
+        stream_lines(std::io::Cursor::new(bytes), TermKind::Output, &tx);
+        drop(tx);
+        let lines: Vec<_> = rx.into_iter().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].text.len() <= MAX_LINE_BYTES);
+        assert!(lines[0].text.ends_with(TRUNCATED));
+        assert_eq!(lines[1].text, "next");
     }
 }

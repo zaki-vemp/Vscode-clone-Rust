@@ -2,7 +2,7 @@
 name = "oxide-code"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "OxideCode - a pure-Rust native desktop code editor (macOS, Linux, Windows)"
 license = "Apache-2.0"
 
@@ -12,10 +12,21 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.32"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+egui_term = { path = "vendor/egui_term" }
 anyhow = "1"
+regex = "1"
+ignore = "=0.4.23"
+globset = "=0.4.16"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+zip = { version = "=2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+egui_extras = { version = "0.32", default-features = false, features = ["svg"] }
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
+csv = "1.4"
+calamine = "0.26"
+quick-xml = "0.41"
+libc = "0.2"
 
 [profile.release]
 lto = true

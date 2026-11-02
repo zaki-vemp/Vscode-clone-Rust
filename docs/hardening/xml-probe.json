@@ -1,0 +1,44 @@
+[
+  {
+    "stage": "before",
+    "attributes": 2000,
+    "elapsed_ms": 8.816,
+    "exit_code": 0,
+    "rejected_by_budget": false
+  },
+  {
+    "stage": "after",
+    "attributes": 2000,
+    "elapsed_ms": 2.749,
+    "exit_code": 1,
+    "rejected_by_budget": true
+  },
+  {
+    "stage": "before",
+    "attributes": 8000,
+    "elapsed_ms": 114.364,
+    "exit_code": 0,
+    "rejected_by_budget": false
+  },
+  {
+    "stage": "after",
+    "attributes": 8000,
+    "elapsed_ms": 2.562,
+    "exit_code": 1,
+    "rejected_by_budget": true
+  },
+  {
+    "stage": "before",
+    "attributes": 16000,
+    "elapsed_ms": 293.26,
+    "exit_code": 0,
+    "rejected_by_budget": false
+  },
+  {
+    "stage": "after",
+    "attributes": 16000,
+    "elapsed_ms": 6.108,
+    "exit_code": 1,
+    "rejected_by_budget": true
+  }
+]

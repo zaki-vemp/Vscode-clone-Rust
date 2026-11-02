@@ -1,9 +1,8 @@
 //! Workspace model: real files on a real filesystem.
 //!
-//! The workspace owns the folder tree, the open [`TextBuffer`]s and the
-//! "write everything in Rust" workflow: new-file templates for every core
-//! language plus one-command scaffolding of new Rust projects (binary or
-//! library crates generated entirely by this app, no `cargo new` needed).
+//! The workspace lazily caches directory listings for the explorer tree,
+//! owns the open [`TextBuffer`]s, and scaffolds new Rust projects (binary
+//! or library crates generated entirely by this app, no `cargo new` needed).
 
 use std::collections::HashMap;
 use std::fs;
@@ -11,25 +10,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::buffer::TextBuffer;
-use crate::languages::Language;
 
-const IGNORED_DIRS: &[&str] = &[
-    "target",
-    ".git",
-    ".agents",
-    ".aistudio",
-    ".gemini",
-    ".github",
-    "assets",
-    "node_modules",
-    ".idea",
-    ".vscode",
-    "dist",
-    "build",
-];
-const MAX_TREE_DEPTH: usize = 8;
-const MAX_SEARCH_FILE_BYTES: u64 = 512 * 1024;
-
+/// Names excluded from the explorer tree (VS Code `files.exclude` defaults).
+const EXCLUDED_NAMES: &[&str] = &[".git", ".svn", ".hg", "CVS", ".DS_Store", "Thumbs.db"];
 /// One line of `git blame` output.
 #[derive(Clone, Debug)]
 pub struct BlameLine {
@@ -44,38 +27,43 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
-    pub children: Vec<FileEntry>,
 }
 
-/// A search hit: `path:line: preview`.
-#[derive(Clone, Debug)]
-pub struct SearchHit {
-    pub path: PathBuf,
-    pub line: usize, // 1-based
-    pub preview: String,
-}
-
-/// An open folder with its tree and open buffers.
+/// An open folder with its lazily-read directory listings and open buffers.
 pub struct Workspace {
     pub root: PathBuf,
-    pub tree: Vec<FileEntry>,
+    dir_cache: HashMap<PathBuf, Vec<FileEntry>>,
     buffers: HashMap<PathBuf, TextBuffer>,
 }
 
 impl Workspace {
     pub fn open_folder(path: &Path) -> io::Result<Self> {
+        if !path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Choose an existing folder",
+            ));
+        }
         let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let mut ws = Self {
+        Ok(Self {
             root,
-            tree: Vec::new(),
+            dir_cache: HashMap::new(),
             buffers: HashMap::new(),
-        };
-        ws.refresh();
-        Ok(ws)
+        })
     }
 
     pub fn refresh(&mut self) {
-        self.tree = read_dir(&self.root, 0);
+        self.dir_cache.clear();
+    }
+
+    /// Cached listing of one directory (sorted: folders first, then
+    /// case-insensitive name), minus `files.exclude` names.
+    pub fn children(&mut self, dir: &Path) -> Vec<FileEntry> {
+        let dir = self.key(dir);
+        self.dir_cache
+            .entry(dir.clone())
+            .or_insert_with(|| read_dir(&dir))
+            .clone()
     }
 
     fn key(&self, path: &Path) -> PathBuf {
@@ -107,10 +95,28 @@ impl Workspace {
         self.buffers.get_mut(&key)
     }
 
+    pub fn dirty_paths(&self) -> Vec<PathBuf> {
+        self.buffers
+            .iter()
+            .filter(|(_, b)| b.is_dirty())
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    pub fn close_buffer(&mut self, path: &Path) {
+        self.buffers.remove(&self.key(path));
+    }
+
     /// Write a buffer back to disk and mark it saved.
     pub fn save(&mut self, path: &Path) -> io::Result<()> {
         let key = self.key(path);
-        let text = self.buffers.get(&key).map(|b| b.text()).unwrap_or_default();
+        let text = self
+            .buffers
+            .get(&key)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "No editable buffer for this file")
+            })?
+            .text();
         if let Some(parent) = key.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -137,21 +143,223 @@ impl Workspace {
         Ok(n)
     }
 
-    /// Create a file with a starter template for its language.
+    /// Create an empty file (VS Code "New File" behavior).
     pub fn new_file(&mut self, dir: &Path, name: &str) -> io::Result<PathBuf> {
         let dir = self.key(dir);
-        fs::create_dir_all(&dir)?;
+        validate_name(name)?;
         let path = dir.join(name);
-        let lang = Language::from_path(name);
-        fs::write(&path, starter_template(lang, name))?;
-        self.buffers.insert(
-            path.clone(),
-            TextBuffer::from_text(&starter_template(lang, name)),
-        );
+        if path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a file or folder with that name already exists",
+            ));
+        }
+        fs::create_dir_all(&dir)?;
+        // Atomic create refuses every existing entry, including dangling
+        // symlinks, and closes the exists()/write() race.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        self.buffers.insert(path.clone(), TextBuffer::from_text(""));
         self.refresh();
         Ok(path)
     }
 
+    /// Create an empty folder.
+    pub fn new_folder(&mut self, dir: &Path, name: &str) -> io::Result<PathBuf> {
+        let dir = self.key(dir);
+        validate_name(name)?;
+        let path = dir.join(name);
+        if path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a file or folder with that name already exists",
+            ));
+        }
+        fs::create_dir_all(&path)?;
+        self.refresh();
+        Ok(path)
+    }
+
+    /// Rename a file or folder, re-keying any open buffers (including
+    /// buffers of files inside a renamed folder).
+    pub fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        let from = self.key(from);
+        let to = self.key(to);
+        if let Some(name) = to.file_name().and_then(|n| n.to_str()) {
+            validate_name(name)?;
+        }
+        if !from.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such file"));
+        }
+        if to.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a file or folder with that name already exists",
+            ));
+        }
+        fs::rename(&from, &to)?;
+        let moved: Vec<(PathBuf, PathBuf)> = self
+            .buffers
+            .keys()
+            .filter(|k| k.starts_with(&from))
+            .map(|k| {
+                let suffix = k.strip_prefix(&from).unwrap_or(k.as_path());
+                (k.clone(), to.join(suffix))
+            })
+            .collect();
+        for (old, new) in moved {
+            if let Some(buf) = self.buffers.remove(&old) {
+                self.buffers.insert(new, buf);
+            }
+        }
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn delete(&mut self, path: &Path) -> io::Result<()> {
+        let key = self.key(path);
+        if key.is_dir() {
+            fs::remove_dir_all(&key)?;
+            let doomed: Vec<PathBuf> = self
+                .buffers
+                .keys()
+                .filter(|k| k.starts_with(&key))
+                .cloned()
+                .collect();
+            for k in doomed {
+                self.buffers.remove(&k);
+            }
+        } else {
+            fs::remove_file(&key)?;
+            self.buffers.remove(&key);
+        }
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn git_blame(&self, path: &Path) -> Vec<BlameLine> {
+        let rel = self.rel_path(path);
+        let out = std::process::Command::new("git")
+            .args(["blame", "--porcelain", "--", &rel])
+            .current_dir(&self.root)
+            .output();
+        let Ok(out) = out else { return Vec::new() };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines: Vec<BlameLine> = Vec::new();
+        let (mut author, mut time, mut summary) = (String::new(), 0i64, String::new());
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("author ") {
+                author = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("author-time ") {
+                time = rest.trim().parse().unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("summary ") {
+                summary = rest.to_string();
+            } else if line.starts_with('\t') {
+                lines.push(BlameLine {
+                    author: author.clone(),
+                    time,
+                    summary: summary.clone(),
+                });
+            }
+        }
+        lines
+    }
+
+    /// Display path relative to the workspace root when possible.
+    pub fn rel_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+    }
+}
+
+fn validate_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || name.contains(['/', '\\']) {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a file name cannot be empty or contain '/' or '\\'",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn read_dir(dir: &Path) -> Vec<FileEntry> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<FileEntry> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            !EXCLUDED_NAMES.contains(&name.as_ref())
+        })
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            FileEntry {
+                is_dir: path.is_dir(),
+                path,
+                name,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then(
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase()),
+        )
+    });
+    out
+}
+
+const MAIN_TEMPLATE: &str = r#"//! Application entry point.
+
+fn main() {
+    println!("Hello, world!");
+}
+
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+"#;
+
+const LIB_TEMPLATE: &str = r#"//! Library crate root.
+
+/// Adds one to the input.
+pub fn add_one(x: i32) -> i32 {
+    x + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_one() {
+        assert_eq!(add_one(1), 2);
+    }
+}
+"#;
+
+impl Workspace {
     /// Scaffold a new Rust project (binary or library) under `parent/name`.
     /// Everything is generated by this app in pure Rust — the result is a
     /// plain `cargo` project you can build immediately.
@@ -197,244 +405,88 @@ impl Workspace {
         fs::write(root.join(".gitignore"), "/target/\n")?;
         Ok(root)
     }
+}
 
-    pub fn delete(&mut self, path: &Path) -> io::Result<()> {
-        let key = self.key(path);
-        if key.is_dir() {
-            fs::remove_dir_all(&key)?;
-        } else {
-            fs::remove_file(&key)?;
-        }
-        self.buffers.remove(&key);
-        self.refresh();
-        Ok(())
+impl Workspace {
+    /// Snapshot of every open buffer (search replaces disk content).
+    pub fn buffer_snapshots(&self) -> Vec<(PathBuf, String)> {
+        self.buffers
+            .iter()
+            .map(|(p, b)| (p.clone(), b.text()))
+            .collect()
     }
 
-    /// Substring search across text files in the workspace.
-    pub fn search(&self, query: &str, max_hits: usize) -> Vec<SearchHit> {
-        let mut hits = Vec::new();
-        if query.is_empty() {
-            return hits;
-        }
-        let mut stack: Vec<PathBuf> = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if !should_ignore(&path) {
-                        stack.push(path);
-                    }
-                    continue;
-                }
-                if hits.len() >= max_hits {
-                    return hits;
-                }
-                if path.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_SEARCH_FILE_BYTES {
-                    continue;
-                }
-                if !is_probably_text(&path) {
-                    continue;
-                }
-                let Ok(text) = fs::read_to_string(&path) else {
-                    continue;
-                };
-                for (i, line) in text.lines().enumerate() {
-                    if line.contains(query) {
-                        hits.push(SearchHit {
-                            path: path.clone(),
-                            line: i + 1,
-                            preview: line.trim().chars().take(120).collect(),
-                        });
-                        if hits.len() >= max_hits {
-                            return hits;
+    /// Replace matches across the frozen snapshots — truly all-or-none:
+    /// every target is prevalidated and every output computed BEFORE a
+    /// single buffer changes. Buffers only; disk untouched.
+    pub fn apply_replacements(
+        &mut self,
+        results: &crate::search::SearchResults,
+        matcher: &crate::search::Matcher,
+        replacement: &str,
+        regex_mode: bool,
+    ) -> Result<(usize, Vec<PathBuf>), String> {
+        // Phase 1: validate every file against its frozen text.
+        for f in &results.files {
+            let abs = self.root.join(&f.path);
+            let cur = match self.get(&abs) {
+                Some(b) => {
+                    let t = b.text();
+                    if !b.is_dirty() {
+                        // Clean buffer: disk may have changed under us.
+                        let disk = std::fs::read_to_string(&abs)
+                            .map_err(|e| format!("{}: {e}", abs.display()))?;
+                        if disk != t {
+                            return Err(format!("{} changed on disk", f.path.display()));
                         }
                     }
+                    t
+                }
+                None => {
+                    std::fs::read_to_string(&abs).map_err(|e| format!("{}: {e}", abs.display()))?
+                }
+            };
+            if cur != f.text {
+                return Err(format!("{} changed since search", f.path.display()));
+            }
+        }
+        // Phase 2: compute ALL new texts (sorted, non-overlapping ranges).
+        let mut outs: Vec<(PathBuf, String)> = Vec::new();
+        let mut total = 0usize;
+        for f in &results.files {
+            let mut ranges: Vec<crate::search::SearchMatch> = f.matches.clone();
+            ranges.sort_by_key(|m| m.range.start);
+            for w in ranges.windows(2) {
+                if w[1].range.start < w[0].range.end {
+                    return Err("overlapping match ranges".into());
                 }
             }
-        }
-        hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-        hits
-    }
-
-    /// Current git branch, best effort (None outside a repo or without git).
-    pub fn git_branch(&self) -> Option<String> {
-        let out = std::process::Command::new("git")
-            .args(["branch", "--show-current"])
-            .current_dir(&self.root)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if branch.is_empty() {
-            None
-        } else {
-            Some(branch)
-        }
-    }
-
-    /// `git blame` for a file, best effort (empty outside a repo / without git).
-    pub fn git_blame(&self, path: &Path) -> Vec<BlameLine> {
-        let rel = self.rel_path(path);
-        let out = std::process::Command::new("git")
-            .args(["blame", "--porcelain", "--", &rel])
-            .current_dir(&self.root)
-            .output();
-        let Ok(out) = out else { return Vec::new() };
-        if !out.status.success() {
-            return Vec::new();
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut lines: Vec<BlameLine> = Vec::new();
-        let (mut author, mut time, mut summary) = (String::new(), 0i64, String::new());
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("author ") {
-                author = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("author-time ") {
-                time = rest.trim().parse().unwrap_or(0);
-            } else if let Some(rest) = line.strip_prefix("summary ") {
-                summary = rest.to_string();
-            } else if line.starts_with('\t') {
-                lines.push(BlameLine { author: author.clone(), time, summary: summary.clone() });
+            let mut text = String::with_capacity(f.text.len());
+            let mut prev = 0usize;
+            for m in &ranges {
+                let rep = matcher.replacement_text(&f.text, &m.range, replacement, regex_mode)?;
+                text.push_str(&f.text[prev..m.range.start]);
+                text.push_str(&rep);
+                prev = m.range.end;
+                total += 1;
             }
+            text.push_str(&f.text[prev..]);
+            outs.push((self.root.join(&f.path), text));
         }
-        lines
-    }
-
-    /// Display path relative to the workspace root when possible.
-    pub fn rel_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned())
-    }
-}
-
-fn read_dir(dir: &Path, depth: usize) -> Vec<FileEntry> {
-    if depth > MAX_TREE_DEPTH {
-        return Vec::new();
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<FileEntry> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| !should_ignore(p))
-        .map(|path| {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let is_dir = path.is_dir();
-            let children = if is_dir {
-                read_dir(&path, depth + 1)
-            } else {
-                Vec::new()
-            };
-            FileEntry {
-                path,
-                name,
-                is_dir,
-                children,
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| (b.name == "main.rs").cmp(&(a.name == "main.rs")))
-            .then(
-                a.name
-                    .to_ascii_lowercase()
-                    .cmp(&b.name.to_ascii_lowercase()),
-            )
-    });
-    out
-}
-
-fn should_ignore(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if name.starts_with('.') && name != ".gitignore" && name != ".cargo" {
-        // Keep dotfiles the user cares about, drop VCS/editor noise.
-        if matches!(name.as_str(), ".git" | ".idea" | ".vscode" | ".DS_Store") {
-            return true;
+        // Phase 3: preload every buffer (any failure still aborts all),
+        // THEN mutate.
+        for (abs, _) in &outs {
+            self.buffer(abs)
+                .map_err(|e| format!("{}: {e}", abs.display()))?;
         }
-    }
-    IGNORED_DIRS.contains(&name.as_str())
-}
-
-fn is_probably_text(path: &Path) -> bool {
-    if Language::from_path(&path.to_string_lossy()) != Language::Plain {
-        return true;
-    }
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-        "txt" | "md" | "log" | "lock" | "" | "gitignore" | "env" | "example"
-    )
-}
-
-/// Starter content for "New File", per language.
-pub fn starter_template(lang: Language, name: &str) -> String {
-    match lang {
-        Language::Rust => format!(
-            "//! {name}\n\nfn main() {{\n    println!(\"Hello from {name}\");\n}}\n"
-        ),
-        Language::Python => format!("#!/usr/bin/env python3\n\"\"\"{name}\"\"\"\n\n\ndef main() -> None:\n    print(\"Hello from {name}\")\n\n\nif __name__ == \"__main__\":\n    main()\n"),
-        Language::JavaScript => format!("// {name}\n\nfunction main() {{\n  console.log('Hello from {name}');\n}}\n\nmain();\n"),
-        Language::TypeScript => format!("// {name}\n\nfunction main(): void {{\n  console.log('Hello from {name}');\n}}\n\nmain();\n"),
-        Language::Go => format!("// {name}\npackage main\n\nimport \"fmt\"\n\nfunc main() {{\n\tfmt.Println(\"Hello from {name}\")\n}}\n"),
-        Language::Markdown => format!("# {name}\n\nWrite here.\n"),
-        Language::Toml => format!("# {name}\n\n[package]\nname = \"example\"\nversion = \"0.1.0\"\n"),
-        Language::Json => "{\n  \"key\": \"value\"\n}\n".to_string(),
-        Language::Shell => format!("#!/usr/bin/env bash\n# {name}\nset -euo pipefail\n\necho 'Hello'\n"),
-        Language::Sql => format!("-- {name}\n\nSELECT 1;\n"),
-        _ => format!("{name}\n"),
+        let mut paths = Vec::new();
+        for (abs, text) in outs {
+            self.get_mut(&abs).unwrap().set_text(&text);
+            paths.push(abs);
+        }
+        Ok((total, paths))
     }
 }
-
-const MAIN_TEMPLATE: &str = r#"//! Application entry point.
-
-fn main() {
-    println!("Hello, world!");
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
-"#;
-
-const LIB_TEMPLATE: &str = r#"//! Library crate root.
-
-/// Adds one to the input.
-pub fn add_one(x: i32) -> i32 {
-    x + 1
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn adds_one() {
-        assert_eq!(add_one(1), 2);
-    }
-}
-"#;
 
 #[cfg(test)]
 mod tests {
@@ -453,7 +505,7 @@ mod tests {
         let root = tmp_root("ws");
         fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
         let mut ws = Workspace::open_folder(&root).unwrap();
-        assert_eq!(ws.tree.len(), 1);
+        assert_eq!(ws.children(&root).len(), 1);
         let buf = ws.buffer(&PathBuf::from("a.rs")).unwrap();
         assert!(!buf.is_dirty());
         buf.set_text("fn a() {}\nfn b() {}\n");
@@ -479,13 +531,54 @@ mod tests {
     }
 
     #[test]
-    fn search_finds_hits() {
-        let root = tmp_root("search");
-        fs::write(root.join("x.rs"), "fn needle() {}\nlet y = 1;\n").unwrap();
-        let ws = Workspace::open_folder(&root).unwrap();
-        let hits = ws.search("needle", 10);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].line, 1);
+    fn new_folder_creates_and_caches() {
+        let root = tmp_root("newfolder");
+        let mut ws = Workspace::open_folder(&root).unwrap();
+        let dir = ws.new_folder(Path::new("."), "sub").unwrap();
+        assert!(dir.is_dir());
+        assert!(ws
+            .children(&root)
+            .iter()
+            .any(|e| e.name == "sub" && e.is_dir));
+        assert!(ws.new_folder(Path::new("."), "sub").is_err());
+        assert!(ws.new_folder(Path::new("."), "a/b").is_err());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_rekeys_open_buffer() {
+        let root = tmp_root("rename");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.rs"), "fn a() {}\n").unwrap();
+        let mut ws = Workspace::open_folder(&root).unwrap();
+        ws.buffer(&root.join("sub/a.rs")).unwrap();
+        ws.rename(&root.join("sub/a.rs"), &root.join("sub/b.rs"))
+            .unwrap();
+        assert!(ws.get(&root.join("sub/b.rs")).is_some());
+        assert!(ws.get(&root.join("sub/a.rs")).is_none());
+        // Renaming a folder re-keys buffers inside it.
+        ws.rename(&root.join("sub"), &root.join("renamed")).unwrap();
+        assert!(ws.get(&root.join("renamed/b.rs")).is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn sec_002_new_file_rejects_dangling_symlink() {
+        let root = tmp_root("dangling-create");
+        let project = root.join("project");
+        fs::create_dir(&project).unwrap();
+        let outside = root.join("outside.rs");
+        std::os::unix::fs::symlink(&outside, project.join("new.rs")).unwrap();
+        let mut workspace = Workspace::open_folder(&project).unwrap();
+        let result = workspace.new_file(&project, "new.rs");
+        assert!(
+            result.is_err(),
+            "New File must reject an existing directory entry, including dangling links"
+        );
+        assert!(
+            !outside.exists(),
+            "New File must not follow an existing symlink"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

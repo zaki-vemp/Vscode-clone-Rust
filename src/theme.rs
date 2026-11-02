@@ -1,5 +1,5 @@
-//! Application color themes matching the `.aistudio` design specification.
-//! All rendering goes through these colors; there is no CSS and no web technology.
+//! Application color themes. All rendering goes through these colors;
+//! Official VS Code themes are loaded from vendored upstream JSONC sources.
 
 use eframe::egui;
 
@@ -7,8 +7,12 @@ use eframe::egui;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ThemeKind {
     #[default]
-    RustOxide,
     DarkModern,
+    LightModern,
+    DarkPlus,
+    LightPlus,
+    HighContrastDark,
+    HighContrastLight,
     TokyoNight,
     Catppuccin,
     Monokai,
@@ -17,11 +21,15 @@ pub enum ThemeKind {
 impl ThemeKind {
     pub fn all() -> &'static [(&'static str, ThemeKind)] {
         &[
-            ("Rust Oxide Dark", ThemeKind::RustOxide),
             ("VS Code Dark Modern", ThemeKind::DarkModern),
+            ("VS Code Light Modern", ThemeKind::LightModern),
+            ("VS Code Dark+", ThemeKind::DarkPlus),
+            ("VS Code Light+", ThemeKind::LightPlus),
+            ("VS Code Dark High Contrast", ThemeKind::HighContrastDark),
+            ("VS Code Light High Contrast", ThemeKind::HighContrastLight),
             ("Tokyo Night", ThemeKind::TokyoNight),
             ("Catppuccin Mocha", ThemeKind::Catppuccin),
-            ("Monokai Pro", ThemeKind::Monokai),
+            ("Monokai", ThemeKind::Monokai),
         ]
     }
 
@@ -30,66 +38,74 @@ impl ThemeKind {
             .iter()
             .find(|(_, k)| *k == self)
             .map(|(n, _)| *n)
-            .unwrap_or("Rust Oxide Dark")
+            .unwrap_or("VS Code Dark Modern")
     }
 
     pub fn colors(self) -> Theme {
+        let official = match self {
+            Self::DarkModern => Some(("dark_modern.json", false)),
+            Self::LightModern => Some(("light_modern.json", true)),
+            Self::DarkPlus => Some(("dark_plus.json", false)),
+            Self::LightPlus => Some(("light_plus.json", true)),
+            Self::HighContrastDark => Some(("hc_black.json", false)),
+            Self::HighContrastLight => Some(("hc_light.json", true)),
+            _ => None,
+        };
+        if let Some((file, light)) = official {
+            let mut theme = crate::vscode_theme::builtin(file, light);
+            theme.name = self.name().to_string();
+            theme
+        } else {
+            self.base_colors()
+        }
+    }
+
+    pub(crate) fn base_colors(self) -> Theme {
         match self {
-            // Exact palette from .aistudio `rust-oxide`:
-            // windowBg: #15141b, titleBarBg: #111015, activityBarBg: #0e0d12,
-            // sidebarBg: #15141b, editorBg: #17161f, statusBarBg: #ea580c,
-            // tabActiveBg: #17161f, tabInactiveBg: #111015, panelBg: #111015,
-            // border: #2a2736, accent: #ea580c, textPrimary: #e4e4e7, textMuted: #71717a
-            ThemeKind::RustOxide => Theme {
-                name: "Rust Oxide Dark",
-                bg: rgb(0x17, 0x16, 0x1f),
-                panel: rgb(0x11, 0x10, 0x15),
-                sidebar: rgb(0x15, 0x14, 0x1b),
-                activity: rgb(0x0e, 0x0d, 0x12),
-                titlebar: rgb(0x11, 0x10, 0x15),
-                tab_bg: rgb(0x11, 0x10, 0x15),
-                tab_active: rgb(0x17, 0x16, 0x1f),
-                status: rgb(0xea, 0x58, 0x0c),
-                status_fg: rgb(0xff, 0xff, 0xff),
-                pill: rgb(0xea, 0x58, 0x0c),
-                border: rgb(0x2a, 0x27, 0x36),
-                text: rgb(0xe4, 0xe4, 0xe7),
-                dim: rgb(0xa1, 0xa1, 0xaa),
-                gutter: rgb(0x52, 0x52, 0x5b),
-                accent: rgb(0xea, 0x58, 0x0c),
-                line_hi: rgba(0x27, 0x27, 0x2a, 110),
-                keyword: rgb(0xc6, 0x78, 0xdd),
-                typ: rgb(0xe5, 0xc0, 0x7b),
-                string: rgb(0x98, 0xc3, 0x79),
-                comment: rgb(0x10, 0xb9, 0x81),
-                number: rgb(0xd1, 0x9a, 0x66),
-                macro_color: rgb(0x61, 0xaf, 0xef),
-                added: rgb(35, 80, 52),
-                added_text: rgb(52, 211, 153),
-                removed: rgb(96, 40, 46),
-                removed_text: rgb(248, 113, 113),
-                error: rgb(248, 113, 113),
-                warning: rgb(251, 191, 36),
-            },
-            // VS Code Dark Modern
             ThemeKind::DarkModern => Theme {
-                name: "VS Code Dark Modern",
+                name: "VS Code Dark Modern".into(),
+                dark: true,
+                comment_italics: false,
+                activity_fg: rgb(0xd7, 0xd7, 0xd7),
+                activity_dim: rgb(0x86, 0x86, 0x86),
+                terminal_bg: rgb(0x18, 0x18, 0x18),
+                terminal_fg: rgb(0xcc, 0xcc, 0xcc),
                 bg: rgb(0x1f, 0x1f, 0x1f),
                 panel: rgb(0x18, 0x18, 0x18),
                 sidebar: rgb(0x18, 0x18, 0x18),
                 activity: rgb(0x18, 0x18, 0x18),
-                titlebar: rgb(0x1f, 0x1f, 0x1f),
+                titlebar: rgb(0x18, 0x18, 0x18),
                 tab_bg: rgb(0x18, 0x18, 0x18),
                 tab_active: rgb(0x1f, 0x1f, 0x1f),
-                status: rgb(0x00, 0x7a, 0xcc),
-                status_fg: rgb(0xff, 0xff, 0xff),
-                pill: rgb(0x00, 0x7a, 0xcc),
+                status: rgb(0x18, 0x18, 0x18),
+                status_fg: rgb(0xcc, 0xcc, 0xcc),
                 border: rgb(0x2b, 0x2b, 0x2b),
                 text: rgb(0xcc, 0xcc, 0xcc),
-                dim: rgb(0x85, 0x85, 0x85),
+                dim: rgb(0x9d, 0x9d, 0x9d),
                 gutter: rgb(0x6e, 0x76, 0x81),
-                accent: rgb(0x00, 0x7a, 0xcc),
-                line_hi: rgba(255, 255, 255, 12),
+                gutter_active: rgb(0xcc, 0xcc, 0xcc),
+                accent: rgb(0x00, 0x78, 0xd4),
+                focus_border: rgb(0x00, 0x78, 0xd4),
+                line_hi: rgb(0x28, 0x28, 0x28),
+                input_bg: rgb(0x31, 0x31, 0x31),
+                input_border: rgb(0x3c, 0x3c, 0x3c),
+                list_hover: rgb(0x2a, 0x2d, 0x2e),
+                list_active: rgb(0x37, 0x37, 0x3d),
+                list_focus: rgb(0x04, 0x39, 0x5e),
+                widget_bg: rgb(0x20, 0x20, 0x20),
+                widget_border: rgb(0x45, 0x45, 0x45),
+                badge_bg: rgb(0x61, 0x61, 0x61),
+                selection: rgb(0x26, 0x4f, 0x78),
+                error: rgb(0xf8, 0x51, 0x49),
+                warning: rgb(0xcc, 0xa7, 0x00),
+                git_added: rgb(0x2e, 0xa0, 0x43),
+                git_modified: rgb(0x00, 0x78, 0xd4),
+                git_deleted: rgb(0xf8, 0x51, 0x49),
+                git_untracked_fg: rgb(0x73, 0xc9, 0x91),
+                git_modified_fg: rgb(0xe2, 0xc0, 0x8d),
+                git_deleted_fg: rgb(0xc7, 0x4e, 0x39),
+                git_ignored_fg: rgb(0x8c, 0x8c, 0x8c),
+                find_match: rgb(0x9e, 0x6a, 0x03),
                 keyword: rgb(86, 156, 214),
                 typ: rgb(78, 201, 176),
                 string: rgb(206, 145, 120),
@@ -100,11 +116,9 @@ impl ThemeKind {
                 added_text: rgb(115, 220, 140),
                 removed: rgb(100, 40, 40),
                 removed_text: rgb(240, 140, 140),
-                error: rgb(244, 71, 71),
-                warning: rgb(220, 200, 120),
             },
             ThemeKind::TokyoNight => Theme {
-                name: "Tokyo Night",
+                name: "Tokyo Night (native approximation)".into(),
                 bg: rgb(0x1a, 0x1b, 0x26),
                 panel: rgb(0x16, 0x16, 0x1e),
                 sidebar: rgb(0x1a, 0x1b, 0x26),
@@ -114,7 +128,6 @@ impl ThemeKind {
                 tab_active: rgb(0x1a, 0x1b, 0x26),
                 status: rgb(0x7a, 0xa2, 0xf7),
                 status_fg: rgb(0x15, 0x16, 0x1e),
-                pill: rgb(0x7a, 0xa2, 0xf7),
                 border: rgb(0x29, 0x2e, 0x42),
                 text: rgb(0xc0, 0xca, 0xf5),
                 dim: rgb(0x56, 0x5f, 0x89),
@@ -133,9 +146,10 @@ impl ThemeKind {
                 removed_text: rgb(247, 140, 160),
                 error: rgb(247, 118, 142),
                 warning: rgb(224, 175, 104),
+                ..ThemeKind::DarkModern.base_colors()
             },
             ThemeKind::Catppuccin => Theme {
-                name: "Catppuccin Mocha",
+                name: "Catppuccin Mocha (native approximation)".into(),
                 bg: rgb(0x1e, 0x1e, 0x2e),
                 panel: rgb(0x18, 0x18, 0x25),
                 sidebar: rgb(0x18, 0x18, 0x25),
@@ -145,7 +159,6 @@ impl ThemeKind {
                 tab_active: rgb(0x1e, 0x1e, 0x2e),
                 status: rgb(0xcb, 0xa6, 0xf7),
                 status_fg: rgb(0x11, 0x11, 0x1b),
-                pill: rgb(0xcb, 0xa6, 0xf7),
                 border: rgb(0x31, 0x32, 0x44),
                 text: rgb(0xcd, 0xd6, 0xf4),
                 dim: rgb(0x6c, 0x70, 0x86),
@@ -164,9 +177,10 @@ impl ThemeKind {
                 removed_text: rgb(243, 139, 168),
                 error: rgb(243, 139, 168),
                 warning: rgb(249, 226, 175),
+                ..ThemeKind::DarkModern.base_colors()
             },
             ThemeKind::Monokai => Theme {
-                name: "Monokai Pro",
+                name: "Monokai (native approximation)".into(),
                 bg: rgb(0x27, 0x28, 0x22),
                 panel: rgb(0x1d, 0x1d, 0x1d),
                 sidebar: rgb(0x22, 0x22, 0x22),
@@ -176,7 +190,6 @@ impl ThemeKind {
                 tab_active: rgb(0x27, 0x28, 0x22),
                 status: rgb(0xff, 0xd8, 0x66),
                 status_fg: rgb(0x22, 0x22, 0x22),
-                pill: rgb(0xff, 0xd8, 0x66),
                 border: rgb(0x38, 0x38, 0x30),
                 text: rgb(0xf8, 0xf8, 0xf2),
                 dim: rgb(0x75, 0x71, 0x5e),
@@ -195,7 +208,9 @@ impl ThemeKind {
                 removed_text: rgb(249, 150, 150),
                 error: rgb(249, 38, 114),
                 warning: rgb(255, 216, 102),
+                ..ThemeKind::DarkModern.base_colors()
             },
+            _ => ThemeKind::DarkModern.base_colors(),
         }
     }
 }
@@ -209,9 +224,15 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> egui::Color32 {
 }
 
 /// Concrete RGB values for every UI surface and syntax token.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Theme {
-    pub name: &'static str,
+    pub name: String,
+    pub dark: bool,
+    pub comment_italics: bool,
+    pub activity_fg: egui::Color32,
+    pub activity_dim: egui::Color32,
+    pub terminal_bg: egui::Color32,
+    pub terminal_fg: egui::Color32,
     pub bg: egui::Color32,
     pub panel: egui::Color32,
     pub sidebar: egui::Color32,
@@ -221,14 +242,41 @@ pub struct Theme {
     pub tab_active: egui::Color32,
     pub status: egui::Color32,
     pub status_fg: egui::Color32,
-    #[allow(dead_code)]
-    pub pill: egui::Color32,
     pub border: egui::Color32,
     pub text: egui::Color32,
     pub dim: egui::Color32,
     pub gutter: egui::Color32,
+    pub gutter_active: egui::Color32,
     pub accent: egui::Color32,
+    pub focus_border: egui::Color32,
     pub line_hi: egui::Color32,
+    pub input_bg: egui::Color32,
+    pub input_border: egui::Color32,
+    pub list_hover: egui::Color32,
+    pub list_active: egui::Color32,
+    pub list_focus: egui::Color32,
+    pub widget_bg: egui::Color32,
+    pub widget_border: egui::Color32,
+    pub badge_bg: egui::Color32,
+    pub selection: egui::Color32,
+    pub error: egui::Color32,
+    pub warning: egui::Color32,
+    // Git gutter + SCM decorations, consumed by phases 3–4.
+    #[allow(dead_code)]
+    pub git_added: egui::Color32,
+    #[allow(dead_code)]
+    pub git_modified: egui::Color32,
+    #[allow(dead_code)]
+    pub git_deleted: egui::Color32,
+    #[allow(dead_code)]
+    pub git_untracked_fg: egui::Color32,
+    pub git_modified_fg: egui::Color32,
+    #[allow(dead_code)]
+    pub git_deleted_fg: egui::Color32,
+    pub git_ignored_fg: egui::Color32,
+    // Editor find-highlight color, consumed by phase 4.
+    #[allow(dead_code)]
+    pub find_match: egui::Color32,
     pub keyword: egui::Color32,
     pub typ: egui::Color32,
     pub string: egui::Color32,
@@ -239,36 +287,138 @@ pub struct Theme {
     pub added_text: egui::Color32,
     pub removed: egui::Color32,
     pub removed_text: egui::Color32,
-    pub error: egui::Color32,
-    pub warning: egui::Color32,
+}
+
+/// Register the codicon font plus any system UI/monospace fonts that exist
+/// on this platform. Missing files are silently skipped; egui defaults
+/// remain as the fallback glyphs.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    fonts.font_data.insert(
+        "codicon".to_owned(),
+        egui::FontData::from_static(include_bytes!("assets/codicon.ttf")).into(),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("codicon".into()),
+        vec!["codicon".to_owned()],
+    );
+
+    #[cfg(target_os = "linux")]
+    const UI_FONTS: &[&str] = &[
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+    #[cfg(target_os = "macos")]
+    const UI_FONTS: &[&str] = &[
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ];
+    #[cfg(target_os = "windows")]
+    const UI_FONTS: &[&str] = &["C:\\Windows\\Fonts\\segoeui.ttf"];
+
+    #[cfg(target_os = "linux")]
+    const MONO_FONTS: &[&str] = &["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"];
+    #[cfg(target_os = "macos")]
+    const MONO_FONTS: &[&str] = &["/System/Library/Fonts/Menlo.ttc"];
+    #[cfg(target_os = "windows")]
+    const MONO_FONTS: &[&str] = &["C:\\Windows\\Fonts\\consola.ttf"];
+
+    #[cfg(target_os = "linux")]
+    const BOLD_FONTS: &[&str] = &[
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ];
+    #[cfg(target_os = "macos")]
+    const BOLD_FONTS: &[&str] = &[];
+    #[cfg(target_os = "windows")]
+    const BOLD_FONTS: &[&str] = &["C:\\Windows\\Fonts\\segoeuib.ttf"];
+
+    let load = |fonts: &mut egui::FontDefinitions, paths: &[&str]| -> Vec<String> {
+        let mut names = Vec::new();
+        for path in paths {
+            if let Ok(bytes) = std::fs::read(path) {
+                let name = format!("file:{path}");
+                fonts
+                    .font_data
+                    .insert(name.clone(), egui::FontData::from_owned(bytes).into());
+                names.push(name);
+            }
+        }
+        names
+    };
+
+    let ui_fonts = load(&mut fonts, UI_FONTS);
+    let mono_fonts = load(&mut fonts, MONO_FONTS);
+    let bold_fonts = load(&mut fonts, BOLD_FONTS);
+
+    let insert_front = |family: &mut Vec<String>, names: &[String]| {
+        for (i, n) in names.iter().enumerate() {
+            family.insert(i.min(family.len()), n.clone());
+        }
+    };
+    if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        insert_front(prop, &ui_fonts);
+    }
+    if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        insert_front(mono, &mono_fonts);
+    }
+    // `bold` must always resolve: egui panics on undefined families.
+    let mut bold = bold_fonts;
+    bold.extend(
+        fonts.families[&egui::FontFamily::Proportional]
+            .iter()
+            .cloned(),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("bold".into()), bold);
+
+    ctx.set_fonts(fonts);
 }
 
 /// Apply the theme to egui's global visuals plus the editor font size.
 pub fn apply(ctx: &egui::Context, theme: &Theme, font_size: f32) {
-    let mut visuals = egui::Visuals::dark();
+    let mut visuals = if theme.dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     visuals.panel_fill = theme.panel;
-    visuals.window_fill = theme.sidebar;
-    visuals.window_stroke = egui::Stroke::new(1.0, theme.border);
-    visuals.extreme_bg_color = theme.bg;
+    visuals.window_fill = theme.widget_bg;
+    visuals.window_stroke = egui::Stroke::new(1.0, theme.widget_border);
+    visuals.window_corner_radius = egui::CornerRadius::same(5);
+    visuals.menu_corner_radius = egui::CornerRadius::same(5);
+    visuals.extreme_bg_color = theme.input_bg;
     visuals.code_bg_color = theme.bg;
-    visuals.faint_bg_color = theme.sidebar;
+    visuals.faint_bg_color = theme.widget_bg;
     visuals.widgets.noninteractive.bg_fill = theme.panel;
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme.text);
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.border);
-    visuals.widgets.inactive.bg_fill = theme.sidebar;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.input_border);
+    visuals.widgets.inactive.bg_fill = theme.input_bg;
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.text);
-    visuals.widgets.inactive.weak_bg_fill = theme.sidebar;
-    visuals.widgets.hovered.bg_fill = theme.border;
-    visuals.widgets.hovered.weak_bg_fill = theme.border;
+    visuals.widgets.inactive.weak_bg_fill = theme.input_bg;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, theme.input_border);
+    visuals.widgets.hovered.bg_fill = theme.list_hover;
+    visuals.widgets.hovered.weak_bg_fill = theme.list_hover;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme.input_border);
     visuals.widgets.active.bg_fill = theme.accent;
-    visuals.widgets.open.bg_fill = theme.sidebar;
-    visuals.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(
-        theme.accent.r(),
-        theme.accent.g(),
-        theme.accent.b(),
-        90,
-    );
-    visuals.selection.stroke = egui::Stroke::new(1.0, theme.text);
+    visuals.widgets.open.bg_fill = theme.widget_bg;
+    for w in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        w.corner_radius = egui::CornerRadius::same(2);
+    }
+    visuals.selection.bg_fill = theme.selection;
+    // egui also uses selection.stroke as selectable-label foreground; keep
+    // it readable on both light and dark selection backgrounds.
+    visuals.selection.stroke = egui::Stroke::new(1.5, theme.text);
     visuals.window_shadow = egui::epaint::Shadow {
         offset: [0, 8],
         blur: 24,
@@ -279,30 +429,31 @@ pub fn apply(ctx: &egui::Context, theme: &Theme, font_size: f32) {
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::monospace(font_size),
+    );
     style
         .text_styles
-        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(font_size));
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        egui::FontId::proportional(font_size.clamp(12.0, 14.0)),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Small,
-        egui::FontId::proportional((font_size - 1.5).max(10.0)),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Button,
-        egui::FontId::proportional(font_size.clamp(12.0, 13.5)),
-    );
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
     style
         .text_styles
         .insert(egui::TextStyle::Heading, egui::FontId::proportional(16.0));
     // Slim VS Code-like scrollbars.
-    style.spacing.scroll.bar_width = 8.0;
+    style.spacing.scroll.bar_width = 10.0;
     style.spacing.scroll.handle_min_length = 36.0;
-    style.spacing.scroll.bar_inner_margin = 2.0;
+    style.spacing.scroll.bar_inner_margin = 0.0;
     style.spacing.scroll.bar_outer_margin = 0.0;
     style.spacing.scroll.floating = true;
+    style.spacing.scroll.dormant_handle_opacity = 0.4;
+    style.spacing.scroll.active_handle_opacity = 0.55;
+    style.spacing.scroll.interact_handle_opacity = 0.8;
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
     style.spacing.button_padding = egui::vec2(8.0, 3.0);
     style.spacing.window_margin = egui::Margin::same(12);

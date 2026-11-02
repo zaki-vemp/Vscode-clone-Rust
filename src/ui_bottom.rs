@@ -1,18 +1,31 @@
-//! Bottom panel: Terminal, Problems, Output (rust-analyzer), Debug Console,
-//! and Rust Telemetry — matching the `.aistudio` VS Code layout with drawn icons.
+//! Bottom panel: PROBLEMS / OUTPUT / DEBUG CONSOLE / TERMINAL tabs with
+//! VS Code panel chrome (text tabs, maximize, close) and Dark Modern
+//! terminal colors.
+
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
 use crate::app::{BottomTab, OxideApp};
 use crate::diagnostics::Severity;
-use crate::icons;
+use crate::icons::{self, ci};
 use crate::terminal::TermKind;
+use crate::theme::Theme;
+
+/// Dark Modern terminal ANSI-ish accents for command output.
+const TERM_SUCCESS: egui::Color32 = egui::Color32::from_rgb(0x0d, 0xbc, 0x79);
+const TERM_ERROR: egui::Color32 = egui::Color32::from_rgb(0xcd, 0x31, 0x31);
+const TERM_INFO: egui::Color32 = egui::Color32::from_rgb(0x24, 0x72, 0xc8);
+const PROB_ERROR: egui::Color32 = egui::Color32::from_rgb(0xf1, 0x4c, 0x4c);
+const PROB_WARNING: egui::Color32 = egui::Color32::from_rgb(0xcc, 0xa7, 0x00);
+const PROB_INFO: egui::Color32 = egui::Color32::from_rgb(0x37, 0x94, 0xff);
 
 pub fn show(app: &mut OxideApp, ctx: &egui::Context) {
     if !app.bottom_open {
         return;
     }
     let theme = app.theme.clone();
+    let max_h = (ctx.screen_rect().height() - 160.0).max(200.0);
     let mut panel = egui::TopBottomPanel::bottom("bottom_panel")
         .resizable(true)
         .frame(
@@ -22,16 +35,17 @@ pub fn show(app: &mut OxideApp, ctx: &egui::Context) {
                 .stroke(egui::Stroke::new(1.0, theme.border)),
         );
     panel = if app.panel_maximized {
-        panel.exact_height(480.0)
+        panel.exact_height(max_h)
     } else {
-        panel.default_height(220.0).min_height(130.0).max_height(520.0)
+        panel
+            .default_height(220.0)
+            .min_height(130.0)
+            .max_height(max_h)
     };
     panel.show(ctx, |ui| {
-        // Tab header bar (32px height).
-        let (header_rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 32.0),
-            egui::Sense::hover(),
-        );
+        // 35px tab header.
+        let (header_rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 35.0), egui::Sense::hover());
         let painter = ui.painter_at(header_rect);
         painter.rect_filled(header_rect, 0.0, theme.panel);
         painter.line_segment(
@@ -44,89 +58,64 @@ pub fn show(app: &mut OxideApp, ctx: &egui::Context) {
 
         let mut child_ui = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(header_rect.shrink2(egui::vec2(10.0, 0.0)))
+                .max_rect(header_rect.shrink2(egui::vec2(16.0, 0.0)))
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        child_ui.spacing_mut().item_spacing.x = 6.0;
+        child_ui.spacing_mut().item_spacing.x = 10.0;
 
         let tabs: &[(BottomTab, &str)] = &[
-            (BottomTab::Terminal, "TERMINAL"),
             (BottomTab::Problems, "PROBLEMS"),
-            (BottomTab::Output, "OUTPUT (rust-analyzer)"),
+            (BottomTab::Output, "OUTPUT"),
             (BottomTab::DebugConsole, "DEBUG CONSOLE"),
-            (BottomTab::RustTelemetry, "RUST TELEMETRY"),
+            (BottomTab::Terminal, "TERMINAL"),
         ];
 
         for &(tab, label) in tabs {
             let selected = app.bottom_tab == tab;
-            let badge_count = if tab == BottomTab::Problems {
-                Some(app.diagnostics.len())
+            let problems = if tab == BottomTab::Problems {
+                app.diagnostics.len()
             } else {
-                None
+                0
             };
-            let w = 24.0
-                + label.len() as f32 * 6.5
-                + if badge_count.is_some() { 22.0 } else { 0.0 };
-            let (trect, resp) = child_ui.allocate_exact_size(
-                egui::vec2(w, 30.0),
-                egui::Sense::click(),
+            let text_g = child_ui.painter().layout_no_wrap(
+                label.to_string(),
+                egui::FontId::proportional(11.0),
+                theme.text,
             );
+            let label_w = text_g.size().x;
+            let w = label_w + if problems > 0 { 22.0 } else { 0.0 };
+            let (trect, resp) =
+                child_ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
             let tp = child_ui.painter_at(trect);
-            let fg = if selected {
-                egui::Color32::WHITE
-            } else if tab == BottomTab::RustTelemetry {
-                egui::Color32::from_rgb(0xfb, 0x92, 0x3c)
-            } else if resp.hovered() {
+            let fg = if selected || resp.hovered() {
                 theme.text
             } else {
                 theme.dim
             };
-            let icon_r = egui::Rect::from_center_size(
-                egui::pos2(trect.left() + 10.0, trect.center().y),
-                egui::vec2(14.0, 14.0),
-            );
-            match tab {
-                BottomTab::Terminal => icons::terminal(&tp, icon_r, fg),
-                BottomTab::Problems => icons::warning_triangle(
-                    &tp,
-                    icon_r,
-                    egui::Color32::from_rgb(0xfb, 0xbf, 0x24),
-                ),
-                BottomTab::Output => icons::doc_file(&tp, icon_r, fg),
-                BottomTab::DebugConsole => icons::bug(&tp, icon_r, fg),
-                BottomTab::RustTelemetry => icons::pulse(
-                    &tp,
-                    icon_r,
-                    egui::Color32::from_rgb(0xfb, 0x92, 0x3c),
-                ),
-            }
-            let text_x = icon_r.right() + 5.0;
-            tp.text(
-                egui::pos2(text_x, trect.center().y),
-                egui::Align2::LEFT_CENTER,
-                label,
-                egui::FontId::proportional(11.0),
+            tp.galley(
+                egui::pos2(trect.left(), trect.center().y - text_g.size().y / 2.0),
+                text_g,
                 fg,
             );
-            if let Some(count) = badge_count {
-                let pill_r = egui::Rect::from_center_size(
+            if problems > 0 {
+                let pill = egui::Rect::from_center_size(
                     egui::pos2(trect.right() - 11.0, trect.center().y),
-                    egui::vec2(16.0, 14.0),
+                    egui::vec2(18.0, 15.0),
                 );
-                tp.rect_filled(pill_r, 7.0, egui::Color32::from_rgb(0x27, 0x27, 0x2a));
+                tp.rect_filled(pill, 8.0, theme.badge_bg);
                 tp.text(
-                    pill_r.center(),
+                    pill.center(),
                     egui::Align2::CENTER_CENTER,
-                    count.to_string(),
-                    egui::FontId::proportional(9.5),
-                    theme.text,
+                    problems.to_string(),
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::WHITE,
                 );
             }
             if selected {
                 tp.rect_filled(
                     egui::Rect::from_min_size(
-                        egui::pos2(trect.left(), trect.bottom() - 2.0),
-                        egui::vec2(trect.width(), 2.0),
+                        egui::pos2(trect.left(), trect.bottom() - 8.0),
+                        egui::vec2(label_w, 1.0),
                     ),
                     0.0,
                     theme.accent,
@@ -141,264 +130,388 @@ pub fn show(app: &mut OxideApp, ctx: &egui::Context) {
             child_ui.spinner();
         }
 
-        // Right-aligned action icons: Trash, Plus, Maximize, Close
         child_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-            icons::close_x(
-                ui.painter(),
-                rect.shrink(4.0),
-                if resp.hovered() { egui::Color32::WHITE } else { theme.dim },
-            );
-            if resp.clicked() {
+            ui.add_space(2.0);
+            if icons::icon_button(ui, ci::CLOSE, "Close Panel (Ctrl+J)", &theme).clicked() {
                 app.bottom_open = false;
             }
-            resp.on_hover_text("Close Panel (Ctrl+J)");
-
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-            icons::maximize(
-                ui.painter(),
-                rect.shrink(2.0),
-                if resp.hovered() { egui::Color32::WHITE } else { theme.dim },
-            );
-            if resp.clicked() {
+            let (glyph, tip) = if app.panel_maximized {
+                (ci::CHEVRON_DOWN, "Restore Panel Size")
+            } else {
+                (ci::CHEVRON_UP, "Maximize Panel Size")
+            };
+            if icons::icon_button(ui, glyph, tip, &theme).clicked() {
                 app.panel_maximized = !app.panel_maximized;
             }
-            resp.on_hover_text(if app.panel_maximized {
-                "Restore Panel Size"
-            } else {
-                "Maximize Panel Size"
-            });
-
             if app.bottom_tab == BottomTab::Terminal {
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-                icons::plus(
-                    ui.painter(),
-                    rect.shrink(3.5),
-                    if resp.hovered() { egui::Color32::WHITE } else { theme.dim },
-                );
-                if resp.clicked() {
-                    app.terminal.reset_banner();
-                    app.focus_terminal = true;
+                if icons::icon_button(ui, ci::TRASH, "Kill Terminal", &theme).clicked() {
+                    if let Some(id) = app.pty.panes.target() {
+                        app.pty.kill(id);
+                    }
                 }
-                resp.on_hover_text("New Terminal");
-
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-                icons::trash(
-                    ui.painter(),
-                    rect.shrink(3.0),
-                    if resp.hovered() { egui::Color32::WHITE } else { theme.dim },
-                );
-                if resp.clicked() {
-                    app.terminal.clear();
+                if icons::icon_button(ui, ci::SPLIT_HORIZONTAL, "Split Terminal", &theme).clicked()
+                {
+                    app.pty.split_session();
                 }
-                resp.on_hover_text("Clear Terminal");
+                if icons::icon_button(ui, ci::ADD, "New Terminal (Ctrl+Shift+`)", &theme).clicked()
+                {
+                    app.pty.new_session();
+                }
+                ui.menu_button(
+                    egui::RichText::new(ci::CHEVRON_DOWN.to_string())
+                        .family(egui::FontFamily::Name("codicon".into()))
+                        .size(14.0),
+                    |ui| {
+                        let names: Vec<String> =
+                            app.pty.profiles.iter().map(|p| p.name.clone()).collect();
+                        for (i, name) in names.iter().enumerate() {
+                            if ui.button(name).clicked() {
+                                app.pty.new_session_with(i);
+                                ui.close();
+                            }
+                        }
+                    },
+                );
             }
         });
 
-        // Content body with inner padding
+        // Content body, VS Code-like side padding.
         egui::Frame::default()
-            .inner_margin(egui::Margin::symmetric(12, 8))
+            .inner_margin(egui::Margin::symmetric(8, 0))
             .show(ui, |ui| match app.bottom_tab {
-                BottomTab::Terminal => show_terminal(app, ui),
                 BottomTab::Problems => show_problems(app, ui),
                 BottomTab::Output => show_output(app, ui),
-                BottomTab::DebugConsole => show_debug_console(app, ui),
-                BottomTab::RustTelemetry => show_telemetry(app, ui),
+                BottomTab::DebugConsole => {}
+                BottomTab::Terminal => show_terminal(app, ui),
             });
     });
 }
 
+fn vscode_terminal_theme(theme: &Theme) -> egui_term::TerminalTheme {
+    let hex = |c: egui::Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+    egui_term::TerminalTheme::new(Box::new(egui_term::ColorPalette {
+        foreground: hex(theme.terminal_fg),
+        background: hex(theme.terminal_bg),
+        black: "#000000".into(),
+        red: "#CD3131".into(),
+        green: "#0DBC79".into(),
+        yellow: "#E5E510".into(),
+        blue: "#2472C8".into(),
+        magenta: "#BC3FBC".into(),
+        cyan: "#11A8CD".into(),
+        white: "#E5E5E5".into(),
+        bright_black: "#666666".into(),
+        bright_red: "#F14C4C".into(),
+        bright_green: "#23D18B".into(),
+        bright_yellow: "#F5F543".into(),
+        bright_blue: "#3B8EEA".into(),
+        bright_magenta: "#D670D6".into(),
+        bright_cyan: "#29B8DB".into(),
+        bright_white: "#E5E5E5".into(),
+        bright_foreground: None,
+        dim_foreground: "#9D9D9D".into(),
+        dim_black: "#000000".into(),
+        dim_red: "#8C3434".into(),
+        dim_green: "#0A7B54".into(),
+        dim_yellow: "#9B9B0C".into(),
+        dim_blue: "#1B5599".into(),
+        dim_magenta: "#8A2F8A".into(),
+        dim_cyan: "#0C7A99".into(),
+        dim_white: "#A8A8A8".into(),
+    }))
+}
+
 fn show_terminal(app: &mut OxideApp, ui: &mut egui::Ui) {
     let theme = app.theme.clone();
-    egui::ScrollArea::vertical()
-        .id_salt("term-scroll")
-        .auto_shrink([false, false])
-        .stick_to_bottom(true)
-        .max_height((ui.available_height() - 30.0).max(40.0))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            for line in app.terminal.lines().iter() {
-                let color = match line.kind {
-                    TermKind::Input => egui::Color32::from_rgb(0xfb, 0x92, 0x3c),
-                    TermKind::Output => theme.text,
-                    TermKind::Error => theme.error,
-                    TermKind::Success => egui::Color32::from_rgb(0x34, 0xd3, 0x99),
-                    TermKind::Info => egui::Color32::from_rgb(0x38, 0xbd, 0xf8),
-                };
-                ui.label(egui::RichText::new(&line.text).color(color).monospace().size(12.0));
+    app.pty.ensure_session();
+    if !app.pty_hook_done {
+        app.pty_hook_done = true;
+        // Test hooks: deterministic split / post-kill states for screenshots.
+        if std::env::var_os("OXIDE_SPLIT").is_some() {
+            app.pty.split_session();
+        }
+        if std::env::var_os("OXIDE_KILL").is_some() {
+            if let Some(id) = app.pty.panes.target() {
+                app.pty.kill(id);
             }
-            if app.terminal.is_busy() {
-                ui.spinner();
+        }
+    }
+    app.pty.poll_events();
+    if let Some(err) = app.pty.last_error.clone() {
+        ui.colored_label(theme.error, err);
+        if ui.button("Retry").clicked() {
+            app.pty.last_error = None;
+            app.pty.new_session();
+        }
+    }
+    if app.pty.is_empty() {
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("New Terminal").color(egui::Color32::WHITE),
+                    )
+                    .fill(theme.accent),
+                )
+                .clicked()
+            {
+                app.pty.new_session();
             }
         });
+        return;
+    }
 
-    ui.add_space(4.0);
-    // Divider above prompt
-    let (div_r, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(div_r, 0.0, egui::Color32::from_rgb(0x27, 0x27, 0x2a));
-    ui.add_space(3.0);
+    // Focus persists per pane: resolve clicks against last frame's rects.
+    let modal = app.modal_open();
 
-    let branch = app
-        .workspace
-        .as_ref()
-        .and_then(|w| w.git_branch())
-        .unwrap_or_else(|| "main".to_string());
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format!(
-                "[oxide-editor] ~/dev/oxide-editor ({branch}) $"
-            ))
-            .color(egui::Color32::from_rgb(0xf9, 0x73, 0x16))
-            .strong()
-            .monospace()
-            .size(11.5),
-        );
-        let id = egui::Id::new("terminal-input");
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut app.term_input)
-                .id(id)
-                .frame(false)
-                .hint_text("type 'cargo run', 'cargo test', 'bench', or 'help'...")
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Monospace),
-        );
-        if app.focus_terminal {
-            resp.request_focus();
-            app.focus_terminal = false;
+    let visible: Vec<u64> = [app.pty.panes.active, app.pty.panes.split]
+        .into_iter()
+        .flatten()
+        .collect();
+    let list_w = if app.pty.sessions().len() > 1 {
+        130.0
+    } else {
+        0.0
+    };
+    let pane_w = (ui.available_width() - list_w) / visible.len().max(1) as f32;
+    let pane_h = ui.available_height();
+    app.term_pane_rects.clear();
+
+    ui.horizontal_top(|ui| {
+        for (i, id) in visible.iter().enumerate() {
+            if i > 0 {
+                ui.separator();
+            }
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(pane_w - 2.0, pane_h), egui::Sense::hover());
+            app.term_pane_rects.push((*id, rect));
+            let focused = app.pty.panes.focused == Some(*id) && !modal;
+            if let Some(session) = app.pty.get(*id) {
+                let mut pane = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .id_salt(("pty-pane", *id)),
+                );
+                let v = egui_term::TerminalView::new(&mut pane, &mut session.backend)
+                    .set_theme(vscode_terminal_theme(&theme))
+                    .set_font(egui_term::TerminalFont::new(egui_term::FontSettings {
+                        font_type: egui::FontId::monospace(app.font_size),
+                    }))
+                    .set_focus(focused)
+                    .set_size(rect.size());
+                pane.add(v);
+            }
         }
-        if resp.has_focus() {
-            if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !app.terminal.history.is_empty() {
-                let idx = match app.terminal.history_idx {
-                    None => app.terminal.history.len() - 1,
-                    Some(i) => i.saturating_sub(1),
-                };
-                app.terminal.history_idx = Some(idx);
-                if let Some(cmd) = app.terminal.history.get(idx) {
-                    app.term_input = cmd.clone();
-                }
-            } else if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                if let Some(i) = app.terminal.history_idx {
-                    if i + 1 < app.terminal.history.len() {
-                        app.terminal.history_idx = Some(i + 1);
-                        app.term_input = app.terminal.history[i + 1].clone();
-                    } else {
-                        app.terminal.history_idx = None;
-                        app.term_input.clear();
+        if list_w > 0.0 {
+            ui.vertical(|ui| {
+                ui.set_max_width(list_w);
+                let ids: Vec<(u64, String, bool)> = app
+                    .pty
+                    .sessions()
+                    .iter()
+                    .map(|s| (s.id, s.title.clone(), s.exited))
+                    .collect();
+                for (id, title, exited) in ids {
+                    let sel = app.pty.panes.active == Some(id) || app.pty.panes.split == Some(id);
+                    let (rect, resp) = ui
+                        .allocate_exact_size(egui::vec2(list_w - 8.0, 20.0), egui::Sense::click());
+                    let p = ui.painter_at(rect);
+                    if sel {
+                        p.rect_filled(rect, 0.0, theme.list_active);
+                    } else if resp.hovered() {
+                        p.rect_filled(rect, 0.0, theme.list_hover);
+                    }
+                    icons::codicon(
+                        &p,
+                        egui::pos2(rect.left() + 9.0, rect.center().y),
+                        ci::TERMINAL,
+                        12.0,
+                        theme.dim,
+                    );
+                    p.text(
+                        egui::pos2(rect.left() + 18.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        if exited {
+                            format!("{title} (exited)")
+                        } else {
+                            title
+                        },
+                        egui::FontId::proportional(11.0),
+                        theme.text,
+                    );
+                    if resp.clicked() {
+                        app.pty.select(id);
                     }
                 }
-            }
-        }
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            let cmd = std::mem::take(&mut app.term_input);
-            if !cmd.trim().is_empty() {
-                let cwd = app.cwd();
-                app.terminal.run_shell(&cmd, &cwd);
-            }
-            resp.request_focus();
+            });
         }
     });
 }
 
 fn show_problems(app: &mut OxideApp, ui: &mut egui::Ui) {
     let theme = app.theme.clone();
-    ui.label(
-        egui::RichText::new(format!(
-            "{} PROBLEMS DETECTED BY CLIPPY & RUST-ANALYZER",
-            app.diagnostics.len()
-        ))
-        .color(theme.dim)
-        .size(10.5)
-        .strong(),
-    );
-    ui.add_space(4.0);
     if app.diagnostics.is_empty() {
+        ui.add_space(8.0);
         ui.label(
             egui::RichText::new(if app.diag_busy {
                 "Checking workspace…"
             } else {
-                "No problems detected in workspace."
+                "No problems have been detected in the workspace."
             })
-            .color(theme.dim),
+            .color(theme.dim)
+            .size(13.0),
         );
         return;
     }
-    let diags = app.diagnostics.clone();
+    // Group by file, preserving first-seen order.
+    let mut groups: Vec<(String, Vec<crate::diagnostics::Diagnostic>)> = Vec::new();
+    for d in &app.diagnostics {
+        match groups.iter_mut().find(|(f, _)| f == &d.file) {
+            Some((_, v)) => v.push(d.clone()),
+            None => groups.push((d.file.clone(), vec![d.clone()])),
+        }
+    }
     egui::ScrollArea::vertical()
         .id_salt("problems-scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (idx, d) in diags.iter().enumerate() {
-                let color = match d.severity {
-                    Severity::Error => theme.error,
-                    Severity::Warning => theme.warning,
-                    Severity::Info => theme.accent,
-                };
-                egui::Frame::default()
-                    .fill(egui::Color32::from_rgb(0x18, 0x18, 0x1b))
-                    .stroke(egui::Stroke::new(1.0, theme.border))
-                    .corner_radius(5.0)
-                    .inner_margin(8.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (ir, _) = ui
-                                .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                            icons::warning_triangle(ui.painter(), ir, color);
-                            ui.vertical(|ui| {
-                                let r = ui.selectable_label(
-                                    false,
-                                    egui::RichText::new(&d.message)
-                                        .color(theme.text)
-                                        .strong()
-                                        .size(12.0),
-                                );
-                                if r.clicked() {
-                                    let root = app.cwd();
-                                    let abs = if std::path::Path::new(&d.file).is_absolute() {
-                                        std::path::PathBuf::from(&d.file)
-                                    } else {
-                                        root.join(&d.file)
-                                    };
-                                    app.goto_location(&abs, d.line);
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}:{}:{} · source: {}",
-                                        d.file,
-                                        d.line,
-                                        d.col,
-                                        d.code.as_deref().unwrap_or("clippy")
-                                    ))
-                                    .color(theme.dim)
-                                    .monospace()
-                                    .size(10.5),
-                                );
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let qf = ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new("💡 Quick Fix")
-                                                .color(egui::Color32::WHITE)
-                                                .size(10.5),
-                                        )
-                                        .fill(theme.accent)
-                                        .corner_radius(4.0),
-                                    );
-                                    if qf.clicked() {
-                                        app.apply_quick_fix(idx);
-                                    }
-                                },
-                            );
-                        });
-                    });
-                ui.add_space(4.0);
+            ui.set_min_width(ui.available_width());
+            for (file, diags) in &groups {
+                file_problem_group(app, ui, file, diags, &theme);
             }
         });
+}
+
+fn file_problem_group(
+    app: &mut OxideApp,
+    ui: &mut egui::Ui,
+    file: &str,
+    diags: &[crate::diagnostics::Diagnostic],
+    theme: &Theme,
+) {
+    let id = ui.make_persistent_id(("problems-group", file));
+    let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, true));
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    if resp.hovered() {
+        p.rect_filled(rect, 0.0, theme.list_hover);
+    }
+    icons::codicon(
+        &p,
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        if open {
+            ci::CHEVRON_DOWN
+        } else {
+            ci::CHEVRON_RIGHT
+        },
+        14.0,
+        theme.text,
+    );
+    let name = Path::new(file)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file.to_string());
+    let dir = Path::new(file)
+        .parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ir = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 24.0, rect.center().y),
+        egui::vec2(14.0, 14.0),
+    );
+    icons::draw_file_icon(&p, ir, &name);
+    let name_g = p.text(
+        egui::pos2(ir.right() + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &name,
+        egui::FontId::proportional(13.0),
+        theme.text,
+    );
+    p.text(
+        egui::pos2(name_g.right() + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        dir,
+        egui::FontId::proportional(11.0),
+        theme.dim,
+    );
+    let pill = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 12.0, rect.center().y),
+        egui::vec2(18.0, 14.0),
+    );
+    p.rect_filled(pill, 7.0, theme.badge_bg);
+    p.text(
+        pill.center(),
+        egui::Align2::CENTER_CENTER,
+        diags.len().to_string(),
+        egui::FontId::proportional(10.0),
+        egui::Color32::WHITE,
+    );
+    if resp.clicked() {
+        open = !open;
+        ui.data_mut(|d| d.insert_persisted(id, open));
+    }
+    if !open {
+        return;
+    }
+    for d in diags {
+        problem_row(app, ui, d, theme);
+    }
+}
+
+fn problem_row(
+    app: &mut OxideApp,
+    ui: &mut egui::Ui,
+    d: &crate::diagnostics::Diagnostic,
+    theme: &Theme,
+) {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    if resp.hovered() {
+        p.rect_filled(rect, 0.0, theme.list_hover);
+    }
+    let (glyph, color) = match d.severity {
+        Severity::Error => (ci::ERROR, PROB_ERROR),
+        Severity::Warning => (ci::WARNING, PROB_WARNING),
+        Severity::Info => (ci::INFO, PROB_INFO),
+    };
+    icons::codicon(
+        &p,
+        egui::pos2(rect.left() + 26.0, rect.center().y),
+        glyph,
+        14.0,
+        color,
+    );
+    let msg_g = p.text(
+        egui::pos2(rect.left() + 36.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &d.message,
+        egui::FontId::proportional(13.0),
+        theme.text,
+    );
+    p.text(
+        egui::pos2(msg_g.right() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!(
+            " rustc({}) [Ln {}, Col {}]",
+            d.code.as_deref().unwrap_or("rustc"),
+            d.line,
+            d.col
+        ),
+        egui::FontId::proportional(11.0),
+        theme.dim,
+    );
+    if resp.clicked() {
+        let root = app.cwd();
+        let abs: PathBuf = if Path::new(&d.file).is_absolute() {
+            PathBuf::from(&d.file)
+        } else {
+            root.join(&d.file)
+        };
+        app.goto_location(&abs, d.line);
+    }
 }
 
 fn show_output(app: &mut OxideApp, ui: &mut egui::Ui) {
@@ -408,35 +521,7 @@ fn show_output(app: &mut OxideApp, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("// Language Server Protocol (rust-analyzer JSON-RPC)")
-                    .color(theme.dim)
-                    .monospace()
-                    .size(11.5),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "[rust-analyzer] Server PID: 49120 · Target: x86_64-unknown-linux-gnu",
-                )
-                .color(theme.text)
-                .monospace()
-                .size(11.5),
-            );
-            ui.label(
-                egui::RichText::new("[rust-analyzer] Loaded workspace with 4 crates in 14.2ms")
-                    .color(theme.text)
-                    .monospace()
-                    .size(11.5),
-            );
-            ui.label(
-                egui::RichText::new(format!(
-                    "[rust-analyzer] PublishDiagnostics: 0 errors, {} warning(s) (0.4ms)",
-                    app.diagnostics.len()
-                ))
-                .color(egui::Color32::from_rgb(0x34, 0xd3, 0x99))
-                .monospace()
-                .size(11.5),
-            );
+            ui.set_min_width(ui.available_width());
             for line in &app.output_lines {
                 ui.label(
                     egui::RichText::new(line)
@@ -445,108 +530,23 @@ fn show_output(app: &mut OxideApp, ui: &mut egui::Ui) {
                         .size(11.5),
                 );
             }
+            // Noninteractive task output (cargo check/test/clippy…).
+            for line in app.terminal.lines().iter() {
+                let color = match line.kind {
+                    TermKind::Error => TERM_ERROR,
+                    TermKind::Success => TERM_SUCCESS,
+                    TermKind::Info => TERM_INFO,
+                    _ => theme.text,
+                };
+                ui.label(
+                    egui::RichText::new(&line.text)
+                        .color(color)
+                        .monospace()
+                        .size(11.5),
+                );
+            }
+            if app.terminal.is_busy() {
+                ui.spinner();
+            }
         });
-}
-
-fn show_debug_console(app: &mut OxideApp, ui: &mut egui::Ui) {
-    let theme = app.theme.clone();
-    let line_count = app
-        .active
-        .as_ref()
-        .and_then(|a| app.workspace.as_ref().and_then(|w| w.get(a)))
-        .map(|b| b.line_count())
-        .unwrap_or(50);
-    egui::ScrollArea::vertical()
-        .id_salt("debug-scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("// LLDB Rust Native Debugger Expression Evaluator")
-                    .color(theme.dim)
-                    .monospace()
-                    .size(11.5),
-            );
-            ui.label(
-                egui::RichText::new("> buffer.line_count()")
-                    .color(theme.text)
-                    .monospace()
-                    .size(11.5),
-            );
-            ui.label(
-                egui::RichText::new(format!("=> {line_count}"))
-                    .color(egui::Color32::from_rgb(0x34, 0xd3, 0x99))
-                    .monospace()
-                    .size(11.5),
-            );
-            ui.label(
-                egui::RichText::new("> wgpu_surface.fps()")
-                    .color(theme.text)
-                    .monospace()
-                    .size(11.5),
-            );
-            ui.label(
-                egui::RichText::new("=> 120.0 FPS")
-                    .color(egui::Color32::from_rgb(0x34, 0xd3, 0x99))
-                    .monospace()
-                    .size(11.5),
-            );
-        });
-}
-
-fn show_telemetry(app: &mut OxideApp, ui: &mut egui::Ui) {
-    let theme = app.theme.clone();
-    ui.columns(4, |cols| {
-        let cards = [
-            (
-                "KEY-TO-GLASS LATENCY",
-                format!("{:.1} ms", app.latency_ms.max(0.8)),
-                egui::Color32::from_rgb(0xfb, 0x92, 0x3c),
-                "⚡ 30x faster than Electron",
-            ),
-            (
-                "HEAP MEMORY (MIMALLOC)",
-                "22.4 MB".to_string(),
-                egui::Color32::from_rgb(0x34, 0xd3, 0x99),
-                "No V8 GC pauses",
-            ),
-            (
-                "RENDER TARGET",
-                "wgpu Native".to_string(),
-                egui::Color32::from_rgb(0xc0, 0x84, 0xfc),
-                "120 FPS Glyph Cache",
-            ),
-            (
-                "EXTENSION HOST",
-                "Wasmtime".to_string(),
-                egui::Color32::from_rgb(0x38, 0xbd, 0xf8),
-                "Pure Sandboxed WASI",
-            ),
-        ];
-        for (i, (title, metric, color, sub)) in cards.iter().enumerate() {
-            egui::Frame::default()
-                .fill(egui::Color32::from_rgb(0x18, 0x18, 0x1b))
-                .stroke(egui::Stroke::new(1.0, theme.border))
-                .corner_radius(6.0)
-                .inner_margin(10.0)
-                .show(&mut cols[i], |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label(
-                        egui::RichText::new(*title)
-                            .color(theme.dim)
-                            .size(10.0)
-                            .strong(),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(metric)
-                            .color(*color)
-                            .monospace()
-                            .strong()
-                            .size(18.0),
-                    );
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new(*sub).color(theme.dim).size(10.5));
-                });
-        }
-    });
 }

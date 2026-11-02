@@ -1,0 +1,102 @@
+{
+  "reviews": [
+    {
+      "name": "paste",
+      "version": "1.0.15",
+      "advisory": "RUSTSEC-2024-0436",
+      "review_by": "2026-12-02",
+      "reason": "Maintenance advisory, not a reported exploitable path. Dependency is transitive; replacement requires a separately reviewed upstream/API migration. No maintenance status is hidden."
+    },
+    {
+      "name": "quick-xml",
+      "version": "0.31.0",
+      "advisory": "RUSTSEC-2026-0194",
+      "review_by": "2026-12-02",
+      "reason": "SEC-001 mitigates the legacy attribute iterator with current quick-xml preflight: <=256 attributes, <=128 nesting, <=16 MiB XML part; same immutable snapshot reaches calamine."
+    },
+    {
+      "name": "quick-xml",
+      "version": "0.31.0",
+      "advisory": "RUSTSEC-2026-0195",
+      "review_by": "2026-12-02",
+      "reason": "Calamine uses plain Reader, not NsReader or NamespaceResolver (source audit). Workbook XML preflight adds attribute, nesting and byte budgets."
+    },
+    {
+      "name": "rustybuzz",
+      "version": "0.20.1",
+      "advisory": "RUSTSEC-2026-0206",
+      "review_by": "2026-12-02",
+      "reason": "Maintenance advisory, not a reported exploitable path. Dependency is transitive; replacement requires a separately reviewed upstream/API migration. No maintenance status is hidden."
+    },
+    {
+      "name": "ttf-parser",
+      "version": "0.25.1",
+      "advisory": "RUSTSEC-2026-0192",
+      "review_by": "2026-12-02",
+      "reason": "Maintenance advisory, not a reported exploitable path. Dependency is transitive; replacement requires a separately reviewed upstream/API migration. No maintenance status is hidden."
+    },
+    {
+      "name": "zbus_names",
+      "version": "4.3.5",
+      "advisory": "RUSTSEC-2026-0371",
+      "review_by": "2026-12-02",
+      "reason": "Maintenance advisory, not a reported exploitable path. Dependency is transitive; replacement requires a separately reviewed upstream/API migration. No maintenance status is hidden."
+    },
+    {
+      "name": "zip",
+      "version": "2.4.2",
+      "advisory": "GHSA-8hxf-qr8p-62x4",
+      "review_by": "2026-12-02",
+      "reason": "Only random-access reads are used. No archive extraction, stream extraction, permission restoration, or AES feature is enabled. Revisit during ZIP/calamine migration."
+    },
+    {
+      "name": "zip",
+      "version": "2.4.2",
+      "advisory": "GHSA-m665-v7pm-7grj",
+      "review_by": "2026-12-02",
+      "reason": "Only random-access reads are used. No archive extraction, stream extraction, permission restoration, or AES feature is enabled. Revisit during ZIP/calamine migration."
+    },
+    {
+      "name": "zip",
+      "version": "2.4.2",
+      "advisory": "GHSA-q7v9-x93c-xqv3",
+      "review_by": "2026-12-02",
+      "reason": "Only random-access reads are used. No archive extraction, stream extraction, permission restoration, or AES feature is enabled. Revisit during ZIP/calamine migration."
+    },
+    {
+      "name": "zip",
+      "version": "2.4.2",
+      "advisory": "RUSTSEC-2026-0367",
+      "review_by": "2026-12-02",
+      "reason": "Only random-access reads are used. No archive extraction, stream extraction, permission restoration, or AES feature is enabled. Revisit during ZIP/calamine migration."
+    },
+    {
+      "name": "zip",
+      "version": "2.4.2",
+      "advisory": "RUSTSEC-2026-0368",
+      "review_by": "2026-12-02",
+      "reason": "Only random-access reads are used. No archive extraction, stream extraction, permission restoration, or AES feature is enabled. Revisit during ZIP/calamine migration."
+    },
+    {
+      "name": "zip",
+      "version": "2.4.2",
+      "advisory": "RUSTSEC-2026-0369",
+      "review_by": "2026-12-02",
+      "reason": "Only random-access reads are used. No archive extraction, stream extraction, permission restoration, or AES feature is enabled. Revisit during ZIP/calamine migration."
+    },
+    {
+      "name": "zvariant",
+      "version": "5.15.1",
+      "advisory": "RUSTSEC-2026-0370",
+      "review_by": "2026-12-02",
+      "reason": "Maintenance advisory, not a reported exploitable path. Dependency is transitive; replacement requires a separately reviewed upstream/API migration. No maintenance status is hidden."
+    },
+    {
+      "name": "zvariant_derive",
+      "version": "5.15.1",
+      "advisory": "RUSTSEC-2026-0372",
+      "review_by": "2026-12-02",
+      "reason": "Maintenance advisory, not a reported exploitable path. Dependency is transitive; replacement requires a separately reviewed upstream/API migration. No maintenance status is hidden."
+    }
+  ]
+}

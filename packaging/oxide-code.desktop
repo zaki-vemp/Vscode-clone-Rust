@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OxideCode
+Comment=Native Rust code editor
+Exec=oxide-code %F
+Icon=oxide-code
+Terminal=false
+Categories=Development;IDE;TextEditor;
+MimeType=text/plain;text/x-rust;
+StartupWMClass=oxide-code

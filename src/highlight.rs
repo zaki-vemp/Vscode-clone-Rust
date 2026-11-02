@@ -3,12 +3,59 @@
 //! scanner per line family that is fast enough for interactive typing.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui::text::{LayoutJob, TextFormat};
 
 use crate::languages::Language;
 use crate::theme::Theme;
+
+/// Keep only the current editor layout. Cursor blinks and mouse movement
+/// reuse it; changing a document, theme, font, or display scale invalidates it.
+#[derive(Default)]
+pub struct HighlightCache(Option<CachedLayout>);
+
+struct CachedLayout {
+    language: Language,
+    theme: Theme,
+    font_size: f32,
+    scale: f32,
+    galley: Arc<egui::Galley>,
+}
+
+impl HighlightCache {
+    pub fn layout(
+        &mut self,
+        ui: &egui::Ui,
+        text: &str,
+        language: Language,
+        theme: &Theme,
+        font_size: f32,
+    ) -> Arc<egui::Galley> {
+        let scale = ui.ctx().pixels_per_point();
+        if let Some(cached) = &self.0 {
+            if cached.language == language
+                && cached.theme == *theme
+                && cached.font_size == font_size
+                && cached.scale == scale
+                && cached.galley.job.text == text
+            {
+                return cached.galley.clone();
+            }
+        }
+        let galley =
+            ui.fonts(|fonts| fonts.layout_job(layout_job(text, language, theme, font_size)));
+        self.0 = Some(CachedLayout {
+            language,
+            theme: theme.clone(),
+            font_size,
+            scale,
+            galley: galley.clone(),
+        });
+        galley
+    }
+}
 
 /// Token classes produced by the scanner.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,12 +128,10 @@ pub fn tokenize_line(
         if matches!(c, '"' | '\'' | '`') && lang != Language::Plain {
             let mut j = i + clen;
             let mut closed = false;
-            let chars: Vec<(usize, char)> = line[i..].char_indices().skip(1).collect();
-            let mut k = 0;
-            while k < chars.len() {
-                let (off, ch) = chars[k];
+            let mut chars = line[i..].char_indices().skip(1);
+            while let Some((off, ch)) = chars.next() {
                 if ch == '\\' {
-                    k += 2; // skip escaped char
+                    chars.next(); // skip escaped char without scanning the rest of the line
                     continue;
                 }
                 if ch == c {
@@ -94,7 +139,6 @@ pub fn tokenize_line(
                     closed = true;
                     break;
                 }
-                k += 1;
             }
             if !closed {
                 j = line.len();
@@ -195,7 +239,11 @@ pub fn symbols(text: &str, lang: Language) -> Vec<(String, usize)> {
             Language::Rust => rust_symbol(t),
             Language::Python if t.starts_with("def ") || t.starts_with("class ") => {
                 let rest = t.trim_start_matches("def ").trim_start_matches("class ");
-                Some(format!("{} {}", if t.starts_with("def") { "fn" } else { "class" }, first_word(rest)))
+                Some(format!(
+                    "{} {}",
+                    if t.starts_with("def") { "fn" } else { "class" },
+                    first_word(rest)
+                ))
             }
             Language::JavaScript | Language::TypeScript
                 if t.starts_with("function ") || t.starts_with("class ") =>
@@ -244,12 +292,18 @@ fn rust_symbol(t: &str) -> Option<String> {
 }
 
 fn first_word(s: &str) -> &str {
-    let end = s.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(s.len());
+    let end = s
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
     &s[..end]
 }
 
 fn truncate_label(s: &str) -> String {
-    if s.len() > 42 { format!("{}…", &s[..41]) } else { s.to_string() }
+    if s.chars().count() > 42 {
+        format!("{}…", s.chars().take(41).collect::<String>())
+    } else {
+        s.to_string()
+    }
 }
 
 /// Build a colored [`LayoutJob`] for the whole document.
@@ -272,7 +326,7 @@ pub fn layout_job(text: &str, lang: Language, theme: &Theme, font_size: f32) -> 
             Tok::Annotation => theme.accent,
             Tok::Punct | Tok::Ident | Tok::Whitespace => theme.text,
         };
-        f.italics = matches!(tok, Tok::Comment);
+        f.italics = tok == Tok::Comment && theme.comment_italics;
         f
     };
 
@@ -333,5 +387,37 @@ mod tests {
         let b = tokenize_line("still comment */ let x = 1;", Language::Rust, &mut st);
         assert!(st.is_none());
         assert!(b.iter().any(|(t, _)| *t == Tok::Keyword));
+    }
+    #[test]
+    #[ignore = "manual scanner benchmark; run with --ignored --nocapture --test-threads=1"]
+    fn hardening_measure_minified_strings() {
+        for entries in [1_000, 2_000, 4_000] {
+            let text = format!("{{{}}}", vec![r#""key":"value""#; entries].join(","));
+            let mut durations = Vec::new();
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let tokens = tokenize_line(std::hint::black_box(&text), Language::Json, &mut None);
+                std::hint::black_box(tokens);
+                durations.push(start.elapsed().as_micros());
+            }
+            durations.sort_unstable();
+            println!(
+                "HARDENING_METRIC {}",
+                serde_json::json!({"case":"minified_strings","entries":entries,"bytes":text.len(),"median_us":durations[2],"samples_us":durations})
+            );
+        }
+    }
+    #[test]
+    fn perf_001_strings_preserve_escaped_unicode_and_unclosed_tail() {
+        let line = r#""猫 \"hello\"" "second""#;
+        let strings: Vec<_> = tokenize_line(line, Language::Json, &mut None)
+            .into_iter()
+            .filter(|(token, _)| *token == Tok::Str)
+            .map(|(_, range)| &line[range])
+            .collect();
+        assert_eq!(strings, vec![r#""猫 \"hello\"""#, r#""second""#]);
+        let tail = "\"unfinished\\";
+        let tokens = tokenize_line(tail, Language::Json, &mut None);
+        assert_eq!(tokens, vec![(Tok::Str, 0..tail.len())]);
     }
 }

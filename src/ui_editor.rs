@@ -1,18 +1,16 @@
-//! Center editor: VS Code-style tabs, breadcrumbs, line-number gutter with git
-//! diff markers, current-line highlight, rust-analyzer inlay hints pill badges,
-//! GitLens inline blame annotation, Copilot ghost text with `[Tab]`, quick-fix
-//! lightbulb button, minimap with viewport slider, side-by-side split view, and
-//! local diff view.
+//! Center editor: VS Code-style tabs, breadcrumbs, line-number gutter,
+//! current-line border highlight, GitLens inline blame, minimap,
+//! side-by-side split view (same file, read-only), and local diff view.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 
-use crate::app::OxideApp;
+use crate::app::{menu_style_accent, OxideApp};
 use crate::diff::{self, DiffTag};
-use crate::highlight::{self, symbols};
-use crate::icons;
-use crate::languages::Language;
+use crate::highlight;
+use crate::icons::{self, ci};
+use crate::theme::Theme;
 
 pub fn show(app: &mut OxideApp, ctx: &egui::Context) {
     egui::CentralPanel::default()
@@ -22,12 +20,60 @@ pub fn show(app: &mut OxideApp, ctx: &egui::Context) {
                 .inner_margin(egui::Margin::ZERO),
         )
         .show(ctx, |ui| {
+            // A Git diff is independent of any editable file — render it
+            // even with no editor open (e.g. a deleted file).
+            if app.git_diff.is_some() {
+                show_git_diff(app, ui);
+                return;
+            }
             if app.active.is_none() {
-                show_welcome(app, ui);
+                show_watermark(app, ui);
                 return;
             }
             show_tabs(app, ui);
             show_breadcrumbs(app, ui);
+            if let Some(active) = app.active.clone() {
+                if app.active_language() == crate::languages::Language::Json {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut app.json_view.tree, false, "Source");
+                        ui.selectable_value(&mut app.json_view.tree, true, "JSON Tree");
+                        if ui.button("Beautify JSON").clicked() {
+                            app.format_json(false);
+                        }
+                        if ui.button("Minify JSON").clicked() {
+                            app.format_json(true);
+                        }
+                    });
+                    if app.json_view.tree {
+                        if let Some(buffer) = app.workspace.as_ref().and_then(|w| w.get(&active)) {
+                            app.json_view.show(
+                                ui,
+                                active.clone(),
+                                buffer.revision(),
+                                &buffer.text(),
+                            );
+                        }
+                        return;
+                    }
+                }
+                if app.preview.wants_preview(&active) {
+                    let source = app
+                        .workspace
+                        .as_ref()
+                        .and_then(|w| w.get(&active))
+                        .map(|b| b.text());
+                    if app.preview.show(ctx, ui, &active, source) {
+                        app.preview.source_paths.insert(active.clone());
+                        app.open_file(&active);
+                    }
+                    return;
+                }
+                if crate::preview::has_source(&active) && ui.button("Open Preview").clicked() {
+                    app.preview.source_paths.remove(&active);
+                    app.preview.invalidate();
+                    return;
+                }
+            }
             if app.diff_mode {
                 show_diff(app, ui);
             } else if app.split_open {
@@ -41,64 +87,133 @@ pub fn show(app: &mut OxideApp, ctx: &egui::Context) {
         });
 }
 
-fn show_welcome(app: &mut OxideApp, ui: &mut egui::Ui) {
+/// VS Code "watermark": a centered list of commands with key pills.
+fn show_watermark(app: &mut OxideApp, ui: &mut egui::Ui) {
     let theme = app.theme.clone();
-    ui.vertical_centered(|ui| {
-        ui.add_space(70.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 10.0, theme.accent);
-        icons::rust_crab(ui.painter(), rect, egui::Color32::WHITE);
-        ui.add_space(10.0);
-        ui.heading(egui::RichText::new("OxideCode").color(theme.text).size(26.0));
-        ui.label(
-            egui::RichText::new("Pure-Rust native desktop clone of VS Code.")
-                .color(theme.dim),
+    let has_folder = app.workspace.is_some();
+    let rows: &[(&str, &str)] = if has_folder {
+        &[
+            ("Show All Commands", "Ctrl+Shift+P"),
+            ("Go to File", "Ctrl+P"),
+            ("Find in Files", "Ctrl+Shift+F"),
+            ("Toggle Terminal", "Ctrl+`"),
+        ]
+    } else {
+        &[
+            ("Open Folder…", ""),
+            ("Show All Commands", "Ctrl+Shift+P"),
+            ("Toggle Terminal", "Ctrl+`"),
+        ]
+    };
+    let row_h = 26.0;
+    let block_h = rows.len() as f32 * row_h;
+    ui.add_space(((ui.available_height() - block_h) * 0.42).max(40.0));
+    for (label, keys) in rows {
+        ui.horizontal(|ui| {
+            let label_g = ui.painter().layout_no_wrap(
+                label.to_string(),
+                egui::FontId::proportional(13.0),
+                theme.dim,
+            );
+            let pill_w = key_pill_w(ui, keys);
+            let total = label_g.size().x + 16.0 + pill_w;
+            ui.add_space(((ui.available_width() - total) * 0.5).max(0.0));
+            let (lr, lresp) =
+                ui.allocate_exact_size(egui::vec2(label_g.size().x, row_h), egui::Sense::click());
+            ui.painter().galley(
+                egui::pos2(lr.left(), lr.center().y - label_g.size().y / 2.0),
+                label_g,
+                theme.dim,
+            );
+            ui.add_space(16.0);
+            if !keys.is_empty() {
+                key_pill(ui, keys, row_h);
+            } else {
+                ui.allocate_exact_size(egui::vec2(pill_w, row_h), egui::Sense::hover());
+            }
+            if lresp.clicked() {
+                watermark_click(app, label);
+            }
+        });
+    }
+}
+
+fn key_pill_w(ui: &mut egui::Ui, keys: &str) -> f32 {
+    if keys.is_empty() {
+        return 0.0;
+    }
+    keys.split('+')
+        .map(|k| {
+            let g = ui.painter().layout_no_wrap(
+                k.trim().to_string(),
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+            g.size().x + 12.0
+        })
+        .sum::<f32>()
+        + 4.0 * keys.matches('+').count() as f32
+}
+
+fn key_pill(ui: &mut egui::Ui, keys: &str, row_h: f32) {
+    let n = keys.split('+').count();
+    for (i, k) in keys.split('+').enumerate() {
+        let k = k.trim();
+        let g = ui.painter().layout_no_wrap(
+            k.to_string(),
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_rgb(0xcc, 0xcc, 0xcc),
         );
-        ui.add_space(22.0);
-        if welcome_action(ui, &theme, "Open Folder…", "File") {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(g.size().x + 12.0, row_h - 8.0),
+            egui::Sense::hover(),
+        );
+        let p = ui.painter_at(rect);
+        p.rect_filled(
+            rect,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(128, 128, 128, 43),
+        );
+        icons::rect_outline(
+            &p,
+            rect,
+            egui::Color32::from_rgba_unmultiplied(51, 51, 51, 153),
+            1.0,
+            3.0,
+        );
+        p.galley(
+            egui::pos2(rect.left() + 6.0, rect.center().y - g.size().y / 2.0),
+            g,
+            egui::Color32::from_rgb(0xcc, 0xcc, 0xcc),
+        );
+        if i + 1 < n {
+            ui.add_space(4.0);
+        }
+    }
+}
+
+fn watermark_click(app: &mut OxideApp, label: &str) {
+    match label {
+        "Show All Commands" | "Go to File" => {
+            app.palette_open = true;
+            app.palette_query.clear();
+            app.palette_selected = 0;
+        }
+        "Find in Files" => {
+            app.activity = crate::app::Activity::Search;
+            app.sidebar_open = true;
+        }
+        "Toggle Terminal" => {
+            app.bottom_open = true;
+            app.bottom_tab = crate::app::BottomTab::Terminal;
+            app.pty.ensure_session();
+        }
+        "Open Folder…" => {
             app.open_folder_input = app.cwd().to_string_lossy().into_owned();
             app.show_open_folder = true;
         }
-        if welcome_action(ui, &theme, "New Rust Project…", "File") {
-            app.new_proj_name.clear();
-            app.show_new_project = true;
-        }
-        if welcome_action(ui, &theme, "Command Palette", "Ctrl+Shift+P") {
-            app.palette_open = true;
-            app.palette_query.clear();
-        }
-        ui.add_space(14.0);
-        ui.label(
-            egui::RichText::new(
-                "Shortcuts: Ctrl+P palette · Ctrl+S save · Ctrl+B sidebar · Ctrl+J panel · Ctrl+\\ split",
-            )
-            .color(theme.dim)
-            .small(),
-        );
-    });
-}
-
-fn welcome_action(
-    ui: &mut egui::Ui,
-    theme: &crate::theme::Theme,
-    label: &str,
-    hint: &str,
-) -> bool {
-    let resp = ui.add(
-        egui::Button::new(egui::RichText::new(label).color(theme.text).size(13.0))
-            .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1.0, theme.border))
-            .min_size(egui::vec2(300.0, 30.0)),
-    );
-    let r = resp.rect;
-    ui.painter().text(
-        egui::pos2(r.right() - 10.0, r.center().y),
-        egui::Align2::RIGHT_CENTER,
-        hint,
-        egui::FontId::proportional(10.5),
-        theme.dim,
-    );
-    resp.clicked()
+        _ => {}
+    }
 }
 
 // ---------- Tabs + breadcrumbs ----------
@@ -106,10 +221,8 @@ fn welcome_action(
 fn show_tabs(app: &mut OxideApp, ui: &mut egui::Ui) {
     let theme = app.theme.clone();
     let tabs = app.tabs.clone();
-    let (bar_rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 36.0),
-        egui::Sense::hover(),
-    );
+    let (bar_rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 35.0), egui::Sense::hover());
     let bp = ui.painter_at(bar_rect);
     bp.rect_filled(bar_rect, 0.0, theme.tab_bg);
     bp.line_segment(
@@ -120,128 +233,197 @@ fn show_tabs(app: &mut OxideApp, ui: &mut egui::Ui) {
         egui::Stroke::new(1.0, theme.border),
     );
 
-    let mut bar_ui = ui.new_child(
+    // Right-side controls region (split + ellipsis), then tabs scroll area.
+    let (right_rect, tabs_rect) = {
+        let w = 56.0;
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(bar_rect.right() - w, bar_rect.top()),
+                bar_rect.max,
+            ),
+            egui::Rect::from_min_max(
+                bar_rect.min,
+                egui::pos2(bar_rect.right() - w, bar_rect.bottom()),
+            ),
+        )
+    };
+
+    let mut tabs_ui = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(bar_rect)
+            .max_rect(tabs_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    bar_ui.spacing_mut().item_spacing.x = 0.0;
+    egui::ScrollArea::horizontal()
+        .id_salt("tabs-scroll")
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .auto_shrink([false, false])
+        .show(&mut tabs_ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for tab in &tabs {
+                    tab_widget(app, ui, tab, &theme);
+                }
+            });
+        });
 
-    for tab in &tabs {
-        let name = tab
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let dirty = app
-            .workspace
-            .as_ref()
-            .and_then(|w| w.get(tab))
-            .is_some_and(|b| b.is_dirty())
-            || app.demo_modified.contains(&name);
-        let selected = app.active.as_ref() == Some(tab);
-        let w = (48.0 + name.chars().count() as f32 * 7.2 + 24.0).max(115.0);
-        let (rect, resp) = bar_ui.allocate_exact_size(egui::vec2(w, 35.0), egui::Sense::click());
-        let painter = bar_ui.painter_at(rect);
-        let bg = if selected {
+    let mut right_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(right_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    right_ui.spacing_mut().item_spacing.x = 2.0;
+    let er = icons::icon_button(&mut right_ui, ci::ELLIPSIS, "Editor Actions", &theme);
+    er.context_menu(|ui| {
+        menu_style_accent(ui, &theme);
+        if ui
+            .add(egui::Button::new("Close All").frame_when_inactive(false))
+            .clicked()
+        {
+            app.close_all();
+            ui.close();
+        }
+        if ui
+            .add(egui::Button::new("Close Saved").frame_when_inactive(false))
+            .clicked()
+        {
+            app.close_saved();
+            ui.close();
+        }
+        if ui
+            .add(egui::Button::new("Toggle Diff vs Saved").frame_when_inactive(false))
+            .clicked()
+        {
+            app.diff_mode = !app.diff_mode;
+            ui.close();
+        }
+    });
+    if icons::icon_button(
+        &mut right_ui,
+        ci::SPLIT_HORIZONTAL,
+        "Split Editor Right (Ctrl+\\)",
+        &theme,
+    )
+    .clicked()
+    {
+        app.split_open = !app.split_open;
+    }
+}
+
+fn tab_widget(app: &mut OxideApp, ui: &mut egui::Ui, tab: &std::path::Path, theme: &Theme) {
+    let name = tab
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dirty = app
+        .workspace
+        .as_ref()
+        .and_then(|w| w.get(tab))
+        .is_some_and(|b| b.is_dirty());
+    let selected = app.active.as_deref() == Some(tab);
+
+    let name_g =
+        ui.painter()
+            .layout_no_wrap(name.clone(), egui::FontId::proportional(13.0), theme.text);
+    let w = 10.0 + 16.0 + 6.0 + name_g.size().x + 6.0 + 20.0 + 4.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 35.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        0.0,
+        if selected {
             theme.tab_active
-        } else if resp.hovered() {
-            egui::Color32::from_rgb(0x1f, 0x1e, 0x29)
         } else {
             theme.tab_bg
-        };
-        painter.rect_filled(rect, 0.0, bg);
-        // Right divider border
-        painter.line_segment(
-            [
-                egui::pos2(rect.right() - 0.5, rect.top()),
-                egui::pos2(rect.right() - 0.5, rect.bottom()),
-            ],
-            egui::Stroke::new(1.0, theme.border),
+        },
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.right() - 0.5, rect.top() + 6.0),
+            egui::pos2(rect.right() - 0.5, rect.bottom() - 6.0),
+        ],
+        egui::Stroke::new(1.0, theme.border),
+    );
+    if selected {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 1.0)),
+            0.0,
+            theme.accent,
         );
-        if selected {
-            // Orange 2px top border on active tab
-            painter.rect_filled(
-                egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 2.0)),
-                0.0,
-                theme.accent,
-            );
-        }
-        let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 16.0, rect.center().y),
-            egui::vec2(14.0, 14.0),
-        );
-        icons::draw_file_icon(&painter, icon_rect, &name);
+    }
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 18.0, rect.center().y),
+        egui::vec2(14.0, 14.0),
+    );
+    icons::draw_file_icon(&painter, icon_rect, &name);
+    ui.painter().galley(
+        egui::pos2(
+            icon_rect.right() + 6.0,
+            rect.center().y - name_g.size().y / 2.0,
+        ),
+        name_g,
+        if selected { theme.text } else { theme.dim },
+    );
 
-        let name_color = if selected {
-            egui::Color32::WHITE
-        } else {
-            theme.dim
-        };
-        painter.text(
-            egui::pos2(icon_rect.right() + 6.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            &name,
-            egui::FontId::proportional(12.0),
-            name_color,
-        );
-
-        let close_center = egui::pos2(rect.right() - 14.0, rect.center().y);
-        let close_rect = egui::Rect::from_center_size(close_center, egui::vec2(12.0, 12.0));
-        if dirty && !resp.hovered() {
-            painter.circle_filled(close_center, 3.5, egui::Color32::WHITE);
-        } else {
-            icons::close_x(&painter, close_rect, theme.dim);
-        }
-
-        if resp.clicked() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                if pos.x > rect.right() - 24.0 {
-                    app.close_tab(tab);
-                    return;
-                }
-            }
-            app.active = Some(tab.clone());
-            app.editor_for = None;
-            app.diff_mode = false;
-        }
-        if resp.middle_clicked() {
-            app.close_tab(tab);
-            return;
-        }
+    // Close slot: dirty dot, X on hover.
+    let close_center = egui::pos2(rect.right() - 14.0, rect.center().y);
+    if dirty && !resp.hovered() {
+        icons::codicon(&painter, close_center, ci::CIRCLE_FILLED, 10.0, theme.dim);
+    } else {
+        icons::codicon(&painter, close_center, ci::CLOSE, 14.0, theme.dim);
     }
 
-    // Right-side tab bar buttons: Split editor icon + More (...) icon
-    bar_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.add_space(6.0);
-        let (mr, mresp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
-        icons::dots_h(
-            ui.painter(),
-            mr,
-            if mresp.hovered() {
-                egui::Color32::WHITE
-            } else {
-                theme.dim
-            },
-        );
-        if mresp.clicked() {
-            app.diff_mode = !app.diff_mode;
+    if resp.middle_clicked() {
+        app.close_tab(tab);
+        return;
+    }
+    if resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if pos.x > rect.right() - 28.0 {
+                app.close_tab(tab);
+                return;
+            }
         }
-        mresp.on_hover_text("Toggle Local Diff vs Saved");
-
-        let (sr, sresp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
-        icons::split(
-            ui.painter(),
-            sr,
-            if app.split_open || sresp.hovered() {
-                egui::Color32::WHITE
-            } else {
-                theme.dim
-            },
-        );
-        if sresp.clicked() {
-            app.split_open = !app.split_open;
+        app.active = Some(tab.to_path_buf());
+        app.editor_for = None;
+        app.diff_mode = false;
+    }
+    let tab_path = tab.to_path_buf();
+    resp.context_menu(|ui| {
+        menu_style_accent(ui, theme);
+        if ui.button("Close").clicked() {
+            app.close_tab(&tab_path);
+            ui.close();
         }
-        sresp.on_hover_text("Split Editor Right (Ctrl+\\)");
+        if ui.button("Close Others").clicked() {
+            app.close_others(&tab_path);
+            ui.close();
+        }
+        if ui.button("Close to the Right").clicked() {
+            app.close_to_right(&tab_path);
+            ui.close();
+        }
+        if ui.button("Close Saved").clicked() {
+            app.close_saved();
+            ui.close();
+        }
+        if ui.button("Close All").clicked() {
+            app.close_all();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Copy Path").clicked() {
+            ui.ctx().copy_text(tab_path.to_string_lossy().into_owned());
+            ui.close();
+        }
+        let rel = app
+            .workspace
+            .as_ref()
+            .map(|w| w.rel_path(&tab_path))
+            .unwrap_or_default();
+        if ui.button("Copy Relative Path").clicked() {
+            ui.ctx().copy_text(rel);
+            ui.close();
+        }
     });
 }
 
@@ -250,7 +432,6 @@ fn show_breadcrumbs(app: &mut OxideApp, ui: &mut egui::Ui) {
         return;
     };
     let theme = app.theme.clone();
-    let lang = app.active_language();
     let rel = app
         .workspace
         .as_ref()
@@ -261,99 +442,76 @@ fn show_breadcrumbs(app: &mut OxideApp, ui: &mut egui::Ui) {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let sym = app
-        .workspace
-        .as_ref()
-        .and_then(|w| w.get(&active))
-        .map(|b| symbols(&b.text(), lang))
-        .unwrap_or_default()
+        .active_symbols()
         .into_iter()
-        .rfind(|(_, l)| *l <= app.cursor.0)
-        .or_else(|| {
-            if lang == Language::Rust {
-                Some(("fn main()".to_string(), 1))
-            } else {
-                None
-            }
-        });
+        .rfind(|(_, line)| *line <= app.cursor.0);
 
-    let (bc_rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 24.0),
-        egui::Sense::hover(),
-    );
+    let (bc_rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
     let bp = ui.painter_at(bc_rect);
     bp.rect_filled(bc_rect, 0.0, theme.bg);
-    bp.line_segment(
-        [
-            egui::pos2(bc_rect.left(), bc_rect.bottom() - 0.5),
-            egui::pos2(bc_rect.right(), bc_rect.bottom() - 0.5),
-        ],
-        egui::Stroke::new(1.0, theme.border),
-    );
+    let crumb_fg = theme.dim;
 
-    let mut bc_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(bc_rect.shrink2(egui::vec2(14.0, 0.0)))
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    bc_ui.spacing_mut().item_spacing.x = 4.0;
-
-    bc_ui.label(
-        egui::RichText::new("oxide-editor")
-            .color(theme.dim)
-            .monospace()
-            .size(11.0),
-    );
+    let mut x = bc_rect.left() + 10.0;
+    let mid = bc_rect.center().y;
+    macro_rules! crumb {
+        ($text:expr) => {{
+            let g = bp.layout_no_wrap(
+                $text.to_string(),
+                egui::FontId::proportional(12.0),
+                crumb_fg,
+            );
+            let w = g.size().x;
+            bp.galley(egui::pos2(x, mid - g.size().y / 2.0), g, crumb_fg);
+            x += w + 4.0;
+        }};
+    }
+    macro_rules! sep {
+        () => {{
+            icons::codicon(
+                &bp,
+                egui::pos2(x + 4.0, mid),
+                ci::CHEVRON_RIGHT,
+                12.0,
+                crumb_fg,
+            );
+            x += 12.0;
+        }};
+    }
 
     let segments: Vec<&str> = rel.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
     for (i, seg) in segments.iter().enumerate() {
-        bc_ui.label(
-            egui::RichText::new("›")
-                .color(theme.gutter)
-                .monospace()
-                .size(12.0),
-        );
         let is_last = i + 1 == segments.len();
         if is_last {
-            let (ir, _) = bc_ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
-            icons::draw_file_icon(bc_ui.painter(), ir, &file_name);
-            bc_ui.label(
-                egui::RichText::new(*seg)
-                    .color(theme.text)
-                    .strong()
-                    .monospace()
-                    .size(11.0),
-            );
+            let ir = egui::Rect::from_center_size(egui::pos2(x + 8.0, mid), egui::vec2(14.0, 14.0));
+            icons::draw_file_icon(&bp, ir, &file_name);
+            x += 20.0;
+            crumb!(seg);
         } else {
-            bc_ui.label(
-                egui::RichText::new(*seg)
-                    .color(theme.dim)
-                    .monospace()
-                    .size(11.0),
-            );
+            crumb!(seg);
+            sep!();
         }
     }
 
     if let Some((label, line)) = sym {
-        bc_ui.label(
-            egui::RichText::new("›")
-                .color(theme.gutter)
-                .monospace()
-                .size(12.0),
-        );
-        let display = if label.starts_with("fn ") && !label.ends_with("()") {
-            format!("{label}()")
+        sep!();
+        let glyph = if label.starts_with("fn ") {
+            ci::SYMBOL_METHOD
+        } else if label.starts_with("struct ") || label.starts_with("enum ") {
+            ci::SYMBOL_STRUCT
         } else {
-            label
+            ci::SYMBOL_VARIABLE
         };
-        let resp = bc_ui.selectable_label(
-            false,
-            egui::RichText::new(display)
-                .color(egui::Color32::from_rgb(0xfb, 0x92, 0x3c))
-                .strong()
-                .monospace()
-                .size(11.0),
+        icons::codicon(&bp, egui::pos2(x + 6.0, mid), glyph, 13.0, crumb_fg);
+        x += 16.0;
+        let g = bp.layout_no_wrap(label, egui::FontId::proportional(12.0), crumb_fg);
+        let srect = egui::Rect::from_min_size(
+            egui::pos2(x, bc_rect.top()),
+            egui::vec2(g.size().x + 8.0, bc_rect.height()),
         );
-        if resp.clicked() {
+        let sresp = ui.interact(srect, ui.id().with("crumb-sym"), egui::Sense::click());
+        bp.galley(egui::pos2(x + 4.0, mid - g.size().y / 2.0), g, crumb_fg);
+        if sresp.clicked() {
             app.goto_location(&active, line);
         }
     }
@@ -375,17 +533,35 @@ fn show_editor(app: &mut OxideApp, ctx: &egui::Context, ui: &mut egui::Ui) {
         }
     }
 
-    // Handle Tab key when Copilot ghost text is active on the current line.
-    if app.copilot_enabled && !app.copilot_accepted && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-        app.copilot_accepted = true;
+    let editor_id = egui::Id::new(("source-editor", &active));
+    if let Some(snippet) = app.pending_snippet.take() {
+        let range = egui::TextEdit::load_state(ctx, editor_id).and_then(|s| s.cursor.char_range());
+        let range = range.map(|r| r.as_sorted_char_range()).unwrap_or(0..0);
+        let byte = |index| {
+            app.editor_text
+                .char_indices()
+                .nth(index)
+                .map(|(offset, _)| offset)
+                .unwrap_or(app.editor_text.len())
+        };
+        let bytes = byte(range.start)..byte(range.end);
+        match crate::snippets::expand(&snippet.body, &active, &app.editor_text[bytes.clone()]) {
+            Ok(expansion) => {
+                app.editor_text.replace_range(bytes, &expansion.text);
+                if let Some(buffer) = app.workspace.as_mut().and_then(|w| w.get_mut(&active)) {
+                    buffer.set_text(&app.editor_text);
+                }
+                app.pending_selection = Some((
+                    active.clone(),
+                    range.start + expansion.selection.start..range.start + expansion.selection.end,
+                ));
+            }
+            Err(error) => app.status(format!("Cannot insert snippet: {error}")),
+        }
     }
 
     let font_size = app.font_size;
-    let tab_size = app.tab_size;
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
-        let job = highlight::layout_job(buf.as_str(), lang, &theme, font_size);
-        ui.fonts(|f| f.layout_job(job))
-    };
+    crate::editor_find::show(app, ui);
 
     let rel = app
         .workspace
@@ -399,40 +575,66 @@ fn show_editor(app: &mut OxideApp, ctx: &egui::Context, ui: &mut egui::Ui) {
         .map(|d| (d.line, d.severity))
         .collect();
 
-    refresh_blame(app, &active);
+    if app.gitlens_blame {
+        refresh_blame(app, &active);
+    }
 
-    let gutter_w = 52.0;
+    // Gutter width tracks the digit count of the last line number.
+    let line_count = app
+        .workspace
+        .as_ref()
+        .and_then(|w| w.get(&active))
+        .map(|b| b.line_count())
+        .unwrap_or(1)
+        .max(1);
+    let digits = line_count.to_string().len();
+    let gutter_w = ui.fonts(|f| {
+        f.layout_no_wrap(
+            "9".repeat(digits),
+            egui::FontId::monospace(font_size),
+            theme.gutter,
+        )
+        .size()
+        .x + 26.0
+    });
     let total_h = ui.available_height();
 
     let mut text_output = None;
     let mut gutter_rect = egui::Rect::NOTHING;
-    egui::ScrollArea::vertical()
-        .id_salt("editor-main-scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                let (gr, _) = ui.allocate_exact_size(
-                    egui::vec2(gutter_w, total_h.max(600.0)),
-                    egui::Sense::hover(),
-                );
-                gutter_rect = gr;
-                let output = egui::TextEdit::multiline(&mut app.editor_text)
-                    .code_editor()
-                    .frame(false)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(38)
-                    .layouter(&mut layouter)
-                    .show(ui);
-                text_output = Some(output);
-            });
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+        app.highlight_cache
+            .layout(ui, buf.as_str(), lang, &theme, font_size)
+    };
+    let mut scroll = egui::ScrollArea::vertical().id_salt(("editor-main-scroll", &active));
+    if let Some((target, line)) = &app.pending_goto {
+        if target == &active {
+            let row_height =
+                ui.fonts(|fonts| fonts.row_height(&egui::FontId::monospace(font_size)));
+            scroll = scroll
+                .vertical_scroll_offset((line.saturating_sub(4) as f32 * row_height).max(0.0));
+        }
+    }
+    scroll.auto_shrink([false, false]).show(ui, |ui| {
+        ui.horizontal_top(|ui| {
+            let (gr, _) = ui.allocate_exact_size(
+                egui::vec2(gutter_w, total_h.max(600.0)),
+                egui::Sense::hover(),
+            );
+            gutter_rect = gr;
+            let output = egui::TextEdit::multiline(&mut app.editor_text)
+                .id(editor_id)
+                .code_editor()
+                .frame(false)
+                .desired_width(f32::INFINITY)
+                .desired_rows(38)
+                .layouter(&mut layouter)
+                .show(ui);
+            text_output = Some(output);
         });
+    });
     let output = text_output.expect("editor shown");
 
     if output.response.changed() {
-        if app.editor_text.contains('\t') {
-            let spaces = " ".repeat(tab_size);
-            app.editor_text = app.editor_text.replace('\t', &spaces);
-        }
         if let Some(ws) = app.workspace.as_mut() {
             if let Some(buf) = ws.get_mut(&active) {
                 buf.set_text(&app.editor_text);
@@ -455,31 +657,58 @@ fn show_editor(app: &mut OxideApp, ctx: &egui::Context, ui: &mut egui::Ui) {
         app.select_all_requested = false;
         let len = app.editor_text.chars().count();
         if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
-            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                egui::text::CCursor::new(0),
-                egui::text::CCursor::new(len),
-            )));
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(len),
+                )));
             state.store(ctx, editor_id);
             need_focus = true;
         }
     }
     if let Some((ref target, line)) = app.pending_goto.clone() {
         if *target == active {
+            let col = app.pending_col.take().unwrap_or(1);
             if let Some(ws) = app.workspace.as_ref() {
                 if let Some(buf) = ws.get(&active) {
-                    let offset = buf.offset_from_line_col(line.saturating_sub(1), 0);
+                    let offset =
+                        buf.offset_from_line_col(line.saturating_sub(1), col.saturating_sub(1));
                     if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
                         let cc = egui::text::CCursor::new(offset);
                         state
                             .cursor
                             .set_char_range(Some(egui::text::CCursorRange::one(cc)));
                         state.store(ctx, editor_id);
-                        need_focus = true;
+                        need_focus = !app.find.open;
                     }
-                    app.cursor = (line, 14);
+                    app.cursor = (line, col);
+                    let caret = output
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(offset));
+                    ui.scroll_to_rect(
+                        caret.translate(output.galley_pos.to_vec2()),
+                        Some(egui::Align::Center),
+                    );
                 }
             }
             app.pending_goto = None;
+        }
+    }
+    if let Some((target, selection)) = app.pending_selection.take() {
+        if target == active {
+            if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(selection.start),
+                        egui::text::CCursor::new(selection.end),
+                    )));
+                state.store(ctx, editor_id);
+                need_focus = !app.find.open;
+            }
+        } else {
+            app.pending_selection = Some((target, selection));
         }
     }
     if need_focus {
@@ -491,20 +720,13 @@ fn show_editor(app: &mut OxideApp, ctx: &egui::Context, ui: &mut egui::Ui) {
         .workspace
         .as_ref()
         .and_then(|w| w.get(&active))
-        .map(|b| b.lines().to_vec())
+        .filter(|_| app.minimap_enabled)
+        .map(|b| b.lines().iter().take(65).cloned().collect())
         .unwrap_or_default();
-    paint_gutter_and_hints(
-        app,
-        ui,
-        &output,
-        gutter_rect,
-        cursor_line,
-        &diag_lines,
-        &lines_snapshot,
-        lang,
-    );
+    paint_gutter(app, ui, &output, gutter_rect, cursor_line, &diag_lines);
+    crate::editor_find::paint(&app.find, ui, &output, theme.find_match);
     if app.minimap_enabled {
-        paint_minimap(app, ui, &output, &lines_snapshot, cursor_line, &active);
+        paint_minimap(app, ui, &output, &lines_snapshot, &active);
     }
 }
 
@@ -516,55 +738,27 @@ fn show_split_pane(app: &mut OxideApp, ui: &mut egui::Ui) {
         [split_rect.left_top(), split_rect.left_bottom()],
         egui::Stroke::new(1.0, theme.border),
     );
-    ui.vertical(|ui| {
-        egui::Frame::default()
-            .fill(theme.tab_bg)
-            .inner_margin(egui::Margin::symmetric(10, 6))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (ir, _) =
-                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                    icons::config_gear(
-                        ui.painter(),
-                        ir,
-                        egui::Color32::from_rgb(0xfb, 0xbf, 0x24),
-                    );
-                    ui.label(
-                        egui::RichText::new("Cargo.toml (Split View)")
-                            .color(theme.text)
-                            .strong()
-                            .size(11.5),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new("Rust Engine")
-                                .color(egui::Color32::from_rgb(0xfb, 0x92, 0x3c))
-                                .monospace()
-                                .size(10.5),
-                        );
-                    });
+    let Some(active) = app.active.clone() else {
+        return;
+    };
+    let lang = app.active_language();
+    let text = app
+        .workspace
+        .as_ref()
+        .and_then(|w| w.get(&active))
+        .map(|b| b.text())
+        .unwrap_or_else(|| app.editor_text.clone());
+    let job = highlight::layout_job(&text, lang, &theme, app.font_size);
+    let galley = ui.fonts(|f| f.layout_job(job));
+    egui::ScrollArea::vertical()
+        .id_salt("split-scroll")
+        .show(ui, |ui| {
+            egui::Frame::default()
+                .inner_margin(egui::Margin::symmetric(12, 4))
+                .show(ui, |ui| {
+                    ui.label(galley);
                 });
-            });
-        let cargo_path = app.cwd().join("Cargo.toml");
-        let cargo_text = app
-            .workspace
-            .as_ref()
-            .and_then(|w| w.get(&cargo_path))
-            .map(|b| b.text())
-            .or_else(|| std::fs::read_to_string(&cargo_path).ok())
-            .unwrap_or_default();
-        let job = highlight::layout_job(&cargo_text, Language::Toml, &theme, app.font_size);
-        let galley = ui.fonts(|f| f.layout_job(job));
-        egui::ScrollArea::vertical()
-            .id_salt("split-scroll")
-            .show(ui, |ui| {
-                egui::Frame::default()
-                    .inner_margin(egui::Margin::symmetric(12, 8))
-                    .show(ui, |ui| {
-                        ui.label(galley);
-                    });
-            });
-    });
+        });
 }
 
 fn refresh_blame(app: &mut OxideApp, active: &std::path::Path) {
@@ -591,27 +785,17 @@ fn refresh_blame(app: &mut OxideApp, active: &std::path::Path) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_gutter_and_hints(
+fn paint_gutter(
     app: &mut OxideApp,
     ui: &mut egui::Ui,
     output: &egui::widgets::text_edit::TextEditOutput,
     gutter_rect: egui::Rect,
     cursor_line: usize,
     diag_lines: &[(usize, crate::diagnostics::Severity)],
-    lines: &[String],
-    lang: Language,
 ) {
     let theme = app.theme.clone();
     let painter = ui.painter_at(output.text_clip_rect.union(gutter_rect));
     painter.rect_filled(gutter_rect, 0.0, theme.bg);
-    painter.line_segment(
-        [
-            egui::pos2(gutter_rect.right() - 0.5, gutter_rect.top()),
-            egui::pos2(gutter_rect.right() - 0.5, gutter_rect.bottom()),
-        ],
-        egui::Stroke::new(1.0, theme.border),
-    );
 
     let galley = &output.galley;
     let origin = output.galley_pos;
@@ -634,38 +818,60 @@ fn paint_gutter_and_hints(
         }
         let is_cursor = line_no == cursor_line;
         if is_cursor {
+            // VS Code renders the current line as a 2px outline, not a fill.
             let hl = egui::Rect::from_min_max(
                 egui::pos2(gutter_rect.right(), row_top),
                 egui::pos2(clip.right() - minimap_w, row_top + row_h),
             );
-            painter.rect_filled(hl, 2.0, theme.line_hi);
-        }
-
-        // Git gutter indicator bars matching the .aistudio screenshot:
-        // green added bar on line 16, blue modified bar on line 22.
-        if line_no == 16 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(gutter_rect.left() + 4.0, row_top + 2.0),
-                    egui::vec2(2.5, row_h - 4.0),
-                ),
-                1.0,
-                egui::Color32::from_rgb(0x10, 0xb9, 0x81),
-            );
-        } else if line_no == 22 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(gutter_rect.left() + 4.0, row_top + 2.0),
-                    egui::vec2(2.5, row_h - 4.0),
-                ),
-                1.0,
-                egui::Color32::from_rgb(0x3b, 0x82, 0xf6),
+            painter.rect_stroke(
+                hl,
+                0.0,
+                egui::Stroke::new(2.0, theme.line_hi),
+                egui::StrokeKind::Inside,
             );
         }
 
-        // Line number
+        // Diagnostic squiggle marker in the gutter.
+        if let Some((_, sev)) = diag_lines.iter().find(|(l, _)| *l == line_no) {
+            icons::codicon(
+                &painter,
+                egui::pos2(gutter_rect.left() + 8.0, row_center),
+                match sev {
+                    crate::diagnostics::Severity::Error => ci::ERROR,
+                    crate::diagnostics::Severity::Warning => ci::WARNING,
+                    crate::diagnostics::Severity::Info => ci::INFO,
+                },
+                12.0,
+                match sev {
+                    crate::diagnostics::Severity::Error => theme.error,
+                    crate::diagnostics::Severity::Warning => theme.warning,
+                    crate::diagnostics::Severity::Info => theme.accent,
+                },
+            );
+        }
+
+        // Git gutter bar from the cached index baseline.
+        if let Some(mark) = app
+            .gutter_marks
+            .as_ref()
+            .and_then(|m| m.iter().find(|(l, _)| *l == line_no).map(|(_, c)| *c))
+        {
+            let c = match mark {
+                'A' => egui::Color32::from_rgb(0x58, 0x7c, 0x0c),
+                'D' => theme.git_deleted,
+                _ => theme.git_modified,
+            };
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(gutter_rect.right() - 2.0, row_top),
+                    egui::pos2(gutter_rect.right(), row_top + row_h),
+                ),
+                0.0,
+                c,
+            );
+        }
         let num_color = if is_cursor {
-            egui::Color32::WHITE
+            theme.gutter_active
         } else {
             theme.gutter
         };
@@ -677,171 +883,76 @@ fn paint_gutter_and_hints(
             num_color,
         );
 
-        let row_text_end = origin.x + prow.row.size.x;
-        let mut cur_x = row_text_end + 10.0;
-        let max_x = clip.right() - minimap_w - 40.0;
-
-        // 1. rust-analyzer Inlay Hints (pill badges with border)
-        if app.inlay_hints && lang == Language::Rust {
-            let hint_str = if line_no == 16 {
-                Some(": Editor".to_string())
-            } else if line_no == 22 {
-                Some(": io::Result<()>".to_string())
-            } else {
-                lines.get(line_no - 1).and_then(|l| literal_hint(l))
-            };
-            if let Some(h) = hint_str {
-                let hw = h.len() as f32 * 6.5 + 10.0;
-                if cur_x + hw < max_x {
-                    let pill = egui::Rect::from_min_size(
-                        egui::pos2(cur_x, row_center - 8.0),
-                        egui::vec2(hw, 16.0),
-                    );
-                    painter.rect_filled(pill, 3.0, egui::Color32::from_rgb(0x27, 0x27, 0x2a));
-                    icons::rect_outline(
-                        &painter,
-                        pill,
-                        egui::Color32::from_rgb(0x3f, 0x3f, 0x46),
-                        1.0,
-                        3.0,
-                    );
+        // GitLens-style inline blame on the active line (real `git blame`).
+        if app.gitlens_blame && is_cursor {
+            if let Some(bl) = app.blame.as_ref().and_then(|(_, _, b)| b.get(line_no - 1)) {
+                let blame_text = format!(
+                    "{}, {} • {}",
+                    bl.author,
+                    rel_time(bl.time),
+                    truncate(&bl.summary, 48)
+                );
+                let x = origin.x + prow.row.size.x + 16.0;
+                if x + 160.0 < clip.right() - minimap_w {
                     painter.text(
-                        pill.center(),
-                        egui::Align2::CENTER_CENTER,
-                        &h,
-                        egui::FontId::monospace(10.0),
-                        theme.dim,
+                        egui::pos2(x, row_center),
+                        egui::Align2::LEFT_CENTER,
+                        blame_text,
+                        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                        theme.git_ignored_fg,
                     );
-                    cur_x = pill.right() + 14.0;
                 }
             }
-        }
-
-        // 2. GitLens Inline Blame on Active Line
-        if app.gitlens_blame && is_cursor {
-            let blame_text = app
-                .blame
-                .as_ref()
-                .and_then(|(_, _, b)| b.get(line_no - 1))
-                .map(|bl| {
-                    format!(
-                        "{}, {} • {}",
-                        bl.author,
-                        rel_time(bl.time),
-                        truncate(&bl.summary, 48)
-                    )
-                })
-                .unwrap_or_else(|| {
-                    "You, 2 hours ago • perf: zero-copy rope buffer commit e89a421".to_string()
-                });
-            if cur_x + 180.0 < max_x {
-                let g = painter.text(
-                    egui::pos2(cur_x, row_center),
-                    egui::Align2::LEFT_CENTER,
-                    blame_text,
-                    egui::FontId::new(11.0, egui::FontFamily::Proportional),
-                    egui::Color32::from_rgb(0x71, 0x71, 0x7a),
-                );
-                cur_x = g.right() + 10.0;
-            }
-        }
-
-        // 3. GitHub Copilot Ghost Text + [Tab] badge on Active Line
-        if app.copilot_enabled && !app.copilot_accepted && is_cursor {
-            let ghost = ".inspect(|e| println!(\"render: {:?}\", e))? ";
-            if cur_x + 160.0 < max_x {
-                let g = painter.text(
-                    egui::pos2(cur_x, row_center),
-                    egui::Align2::LEFT_CENTER,
-                    ghost,
-                    egui::FontId::monospace(app.font_size - 0.5),
-                    egui::Color32::from_rgb(0x71, 0x71, 0x7a),
-                );
-                let tab_pill = egui::Rect::from_min_size(
-                    egui::pos2(g.right() + 4.0, row_center - 7.5),
-                    egui::vec2(28.0, 15.0),
-                );
-                icons::rect_outline(
-                    &painter,
-                    tab_pill,
-                    egui::Color32::from_rgb(0x6b, 0x21, 0xa8),
-                    1.0,
-                    3.0,
-                );
-                painter.text(
-                    tab_pill.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "[Tab]",
-                    egui::FontId::proportional(9.5),
-                    egui::Color32::from_rgb(0xc0, 0x84, 0xfc),
-                );
-            }
-        }
-
-        // 4. Right-aligned Quick Fix Lightbulb button on line 16 or diagnostic lines
-        if line_no == 16 || diag_lines.iter().any(|(l, _)| *l == line_no) {
-            let bulb_box = egui::Rect::from_center_size(
-                egui::pos2(clip.right() - minimap_w - 22.0, row_center),
-                egui::vec2(22.0, 20.0),
-            );
-            painter.rect_filled(bulb_box, 4.0, egui::Color32::from_rgba_unmultiplied(0x45, 0x1a, 0x03, 180));
-            icons::rect_outline(
-                &painter,
-                bulb_box,
-                egui::Color32::from_rgb(0xd9, 0x77, 0x06),
-                1.0,
-                4.0,
-            );
-            icons::bulb(
-                &painter,
-                bulb_box.shrink(3.0),
-                egui::Color32::from_rgb(0xfb, 0xbf, 0x24),
-            );
-            let resp = ui.interact(
-                bulb_box,
-                ui.id().with(("quick-fix-bulb", line_no)),
-                egui::Sense::click(),
-            );
-            if resp.clicked() {
-                app.bottom_open = true;
-                app.bottom_tab = crate::app::BottomTab::Problems;
-            }
-            resp.on_hover_text("Quick Fix: Remove unused `mut` keyword");
         }
     }
 }
 
-fn literal_hint(line: &str) -> Option<String> {
-    let t = line.trim();
-    let rest = t
-        .strip_prefix("let ")
-        .or_else(|| t.strip_prefix("let mut "))?;
-    let lhs = rest.split('=').next()?;
-    if lhs.contains(':') {
-        return None;
+/// Map a diff of (index baseline, buffer) to per-line gutter markers:
+/// 'A' added (green), 'M' modified hunk (blue), 'D' deleted (red edge on
+/// the nearest surviving line).
+pub fn gutter_markers(old: &[String], new: &[String]) -> Vec<(usize, char)> {
+    let rows = crate::diff::diff_lines(old, new);
+    let mut marks: Vec<(usize, char)> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        match rows[i].tag {
+            crate::diff::DiffTag::Insert => {
+                let mut j = i;
+                let mut had_del = false;
+                while j > 0 && rows[j - 1].tag == crate::diff::DiffTag::Delete {
+                    j -= 1;
+                    had_del = true;
+                }
+                let line = rows[i].new_no.unwrap_or(0);
+                if had_del {
+                    marks.push((line, 'M'));
+                } else {
+                    marks.push((line, 'A'));
+                }
+                i += 1;
+            }
+            crate::diff::DiffTag::Delete => {
+                // Standalone deletion (not followed by insert): red edge on
+                // the next surviving new-side line (or last line).
+                let is_hunk_del = rows
+                    .get(i + 1)
+                    .is_some_and(|r| r.tag == crate::diff::DiffTag::Insert)
+                    || i > 0 && rows[i - 1].tag == crate::diff::DiffTag::Insert;
+                if !is_hunk_del {
+                    let nearest = rows
+                        .iter()
+                        .skip(i)
+                        .find_map(|r| r.new_no)
+                        .or_else(|| rows.iter().rev().find_map(|r| r.new_no))
+                        .unwrap_or(0);
+                    marks.push((nearest, 'D'));
+                }
+                i += 1;
+            }
+            crate::diff::DiffTag::Equal => i += 1,
+        }
     }
-    let rhs = rest.split('=').nth(1)?.trim().trim_end_matches(';').trim();
-    if rhs.is_empty() {
-        return None;
-    }
-    let hint = if rhs == "true" || rhs == "false" {
-        ": bool"
-    } else if rhs.starts_with('"') {
-        ": &str"
-    } else if rhs.starts_with("String::") {
-        ": String"
-    } else if rhs.starts_with("vec![") {
-        ": Vec<_>"
-    } else if rhs.starts_with("Some(") {
-        ": Option<_>"
-    } else if rhs.starts_with("Arc::new") {
-        ": Arc<RwLock<RopeBuffer>>"
-    } else if rhs.chars().all(|c| c.is_ascii_digit() || c == '_') {
-        ": i32"
-    } else {
-        return None;
-    };
-    Some(hint.to_string())
+    marks
 }
 
 fn rel_time(ts: i64) -> String {
@@ -878,7 +989,6 @@ fn paint_minimap(
     ui: &mut egui::Ui,
     output: &egui::widgets::text_edit::TextEditOutput,
     lines: &[String],
-    cursor_line: usize,
     active: &std::path::Path,
 ) {
     let theme = app.theme.clone();
@@ -890,10 +1000,6 @@ fn paint_minimap(
     );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.bg);
-    painter.line_segment(
-        [rect.min, egui::pos2(rect.left(), rect.bottom())],
-        egui::Stroke::new(1.0, theme.border),
-    );
     if lines.is_empty() {
         return;
     }
@@ -930,7 +1036,7 @@ fn paint_minimap(
         );
     }
 
-    // Viewport slider box on top of minimap
+    // Viewport slider box on top of the minimap.
     let vp_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 2.0, rect.top() + 6.0),
         egui::vec2(w - 4.0, 62.0),
@@ -940,14 +1046,6 @@ fn paint_minimap(
         2.0,
         egui::Color32::from_rgba_unmultiplied(100, 100, 120, 45),
     );
-    icons::rect_outline(
-        &painter,
-        vp_rect,
-        egui::Color32::from_rgba_unmultiplied(160, 160, 180, 90),
-        1.0,
-        2.0,
-    );
-    let _ = cursor_line;
 
     let resp = ui.interact(rect, ui.id().with("minimap"), egui::Sense::click_and_drag());
     if resp.clicked() || resp.dragged() {
@@ -957,6 +1055,111 @@ fn paint_minimap(
             app.pending_goto = Some((active.to_path_buf(), line));
         }
     }
+}
+
+/// Side-by-side Git diff: HEAD->index (staged) or index->worktree.
+/// `split('\n')` keeps a trailing empty row so newline-only changes show;
+/// a missing side yields zero lines, not one empty line.
+fn split_lines_preserve(text: Option<&str>) -> Vec<String> {
+    match text {
+        None => Vec::new(),
+        Some(t) => t.split('\n').map(|l| l.to_string()).collect(),
+    }
+}
+
+fn show_git_diff(app: &mut OxideApp, ui: &mut egui::Ui) {
+    let Some(d) = app.git_diff.clone() else {
+        app.git_diff = None;
+        return;
+    };
+    let theme = app.theme.clone();
+    let (old_label, new_label) = if d.staged {
+        ("< HEAD", "index >")
+    } else {
+        ("< index", "disk >")
+    };
+    let rows = crate::diff::diff_lines(
+        &split_lines_preserve(d.old_text.as_deref()),
+        &split_lines_preserve(d.new_text.as_deref()),
+    );
+    let rel = app
+        .git
+        .snapshot
+        .as_ref()
+        .and_then(|s| d.path.strip_prefix(&s.root).ok())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| d.path.clone());
+    egui::Frame::default()
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(rel.to_string_lossy().into_owned())
+                        .color(theme.text)
+                        .size(12.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!(" {old_label} / {new_label}"))
+                        .color(theme.dim)
+                        .size(11.0),
+                );
+                if let Some(err) = &d.error {
+                    ui.label(
+                        egui::RichText::new(format!(" — {err}"))
+                            .color(theme.error)
+                            .size(11.0),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close Diff").clicked() {
+                        app.git_diff = None;
+                        app.git.cancel_diff();
+                    }
+                });
+            });
+        });
+    ui.separator();
+    if d.error.is_some() {
+        return;
+    }
+    let font = egui::FontId::monospace(app.font_size);
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.columns(2, |cols| {
+                for (col, side) in [(0, true), (1, false)] {
+                    cols[col].vertical(|ui| {
+                        for row in &rows {
+                            let (text, bg, fg, no) = match (row.tag, side) {
+                                (crate::diff::DiffTag::Delete, true) => (
+                                    row.text.clone(),
+                                    Some(theme.removed),
+                                    theme.removed_text,
+                                    row.old_no,
+                                ),
+                                (crate::diff::DiffTag::Equal, _) => (
+                                    row.text.clone(),
+                                    None,
+                                    theme.text,
+                                    if side { row.old_no } else { row.new_no },
+                                ),
+                                (crate::diff::DiffTag::Insert, false) => (
+                                    row.text.clone(),
+                                    Some(theme.added),
+                                    theme.added_text,
+                                    row.new_no,
+                                ),
+                                _ => (String::new(), Some(theme.sidebar), theme.dim, None),
+                            };
+                            let no = no
+                                .map(|n| format!("{:>4} ", n + 1))
+                                .unwrap_or_else(|| "     ".to_string());
+                            paint_diff_row(ui, &font, &theme, &no, &text, bg, fg);
+                        }
+                    });
+                }
+            });
+        });
 }
 
 // ---------- Split-pane diff view ----------
@@ -997,7 +1200,7 @@ fn show_diff(app: &mut OxideApp, ui: &mut egui::Ui) {
                 ui.label(
                     egui::RichText::new(format!(" -{removed} / +{added} "))
                         .color(egui::Color32::WHITE)
-                        .background_color(theme.border)
+                        .background_color(theme.badge_bg)
                         .small()
                         .monospace(),
                 );
@@ -1068,7 +1271,7 @@ fn show_diff(app: &mut OxideApp, ui: &mut egui::Ui) {
 fn paint_diff_row(
     ui: &mut egui::Ui,
     font: &egui::FontId,
-    theme: &crate::theme::Theme,
+    theme: &Theme,
     line_no: &str,
     text: &str,
     bg: Option<egui::Color32>,
@@ -1119,4 +1322,30 @@ fn paint_diff_row(
         ui.set_min_width(ui.available_width());
         ui.label(galley);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gutter_markers;
+
+    fn lines(s: &str) -> Vec<String> {
+        if s.is_empty() {
+            vec![]
+        } else {
+            s.split('\n').map(|l| l.to_string()).collect()
+        }
+    }
+
+    #[test]
+    fn markers_insert_delete_modify() {
+        // pure insert
+        let m = gutter_markers(&lines("a\nb\n"), &lines("a\nx\nb\n"));
+        assert!(m.contains(&(1, 'A')));
+        // pure modify (delete+insert same hunk)
+        let m = gutter_markers(&lines("a\nb\n"), &lines("a\nB\n"));
+        assert!(m.contains(&(1, 'M')) && !m.iter().any(|(_, c)| *c == 'A'));
+        // pure delete -> red edge on nearest surviving line
+        let m = gutter_markers(&lines("a\nb\nc\n"), &lines("a\nc\n"));
+        assert!(m.iter().any(|(_, c)| *c == 'D'));
+    }
 }
