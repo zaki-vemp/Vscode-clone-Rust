@@ -104,10 +104,12 @@ pub fn icon_button(
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
     if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, 5.0, Color32::from_rgba_unmultiplied(90, 93, 94, 79));
+        ui.painter().rect_filled(rect, 2.0, theme.list_hover);
     }
     codicon(ui.painter(), rect.center(), glyph, 16.0, theme.text);
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+    });
     resp.on_hover_text(tooltip)
 }
 

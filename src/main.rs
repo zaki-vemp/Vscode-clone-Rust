@@ -12,6 +12,7 @@ mod diagnostics;
 mod diff;
 mod editor_find;
 mod extensions;
+mod file_dialog;
 mod git;
 mod highlight;
 mod icons;

@@ -71,12 +71,29 @@ struct SavedConfig {
     check_on_save: Option<bool>,
     minimap_enabled: Option<bool>,
     gitlens_blame: Option<bool>,
+    #[serde(default)]
+    recent_folders: Vec<String>,
+    auto_save: Option<bool>,
+}
+
+/// Destructive / branch Git confirmations (VS Code-style modal prompts).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GitConfirm {
+    DiscardAll,
+    DiscardAllTracked,
+    CleanAll,
+    DiscardStaged(std::path::PathBuf),
+    Clean(std::path::PathBuf),
+    DropStash(usize),
+    DeleteBranch(String),
+    UndoCommit,
 }
 
 #[derive(Clone)]
 enum UnsavedAction {
     CloseTabs(Vec<PathBuf>),
     OpenFolder(PathBuf),
+    CloseFolder,
     Quit,
 }
 
@@ -131,6 +148,15 @@ pub struct OxideApp {
     pub gutter_source: Option<(PathBuf, Option<String>, u64)>,
     pub scm_msg: String,
     pub confirm_discard: Option<std::path::PathBuf>,
+    pub confirm_git: Option<GitConfirm>,
+    pub recent_folders: Vec<PathBuf>,
+    pub auto_save: bool,
+    pub show_stash_dialog: bool,
+    pub stash_input: String,
+    pub stash_include_untracked: bool,
+    pub stash_keep_index: bool,
+    pub show_branch_dialog: bool,
+    pub branch_input: String,
     pub term_pane_rects: Vec<(u64, egui::Rect)>,
     pub pty_hook_done: bool,
     pub output_lines: Vec<String>,
@@ -186,6 +212,9 @@ impl OxideApp {
             || self.show_goto
             || self.confirm_delete.is_some()
             || self.confirm_discard.is_some()
+            || self.confirm_git.is_some()
+            || self.show_stash_dialog
+            || self.show_branch_dialog
             || self.show_open_folder
             || self.show_new_project
             || self.show_add_extension
@@ -336,6 +365,15 @@ impl OxideApp {
             gutter_source: None,
             scm_msg: String::new(),
             confirm_discard: None,
+            confirm_git: None,
+            recent_folders: Vec::new(),
+            auto_save: false,
+            show_stash_dialog: false,
+            stash_input: String::new(),
+            stash_include_untracked: false,
+            stash_keep_index: false,
+            show_branch_dialog: false,
+            branch_input: String::new(),
             output_lines: Vec::new(),
             diagnostics: Vec::new(),
             diag_rx: None,
@@ -436,6 +474,7 @@ impl OxideApp {
                 "search" => Activity::Search,
                 "debug" => Activity::Debug,
                 "extensions" => Activity::Extensions,
+                "settings" => Activity::Settings,
                 _ => Activity::Explorer,
             };
             app.sidebar_open = true;
@@ -448,6 +487,12 @@ impl OxideApp {
                 "debugconsole" => BottomTab::DebugConsole,
                 _ => BottomTab::Terminal,
             };
+        }
+        if let Ok(query) = std::env::var("OXIDE_SEARCH") {
+            app.search_opts.query = query;
+            app.search_opts.include = std::env::var("OXIDE_SEARCH_INCLUDE").unwrap_or_default();
+            app.search_opts.regex = std::env::var_os("OXIDE_SEARCH_REGEX").is_some();
+            app.run_search();
         }
 
         theme::apply(&cc.egui_ctx, &app.theme, app.font_size);
@@ -520,10 +565,194 @@ impl OxideApp {
                 self.git_branch = None;
                 self.git_branch_at = Instant::now() - std::time::Duration::from_secs(60);
                 self.open_folder_input = self.cwd().to_string_lossy().into_owned();
+                let root = self.cwd();
+                self.recent_folders.retain(|p| p != &root);
+                self.recent_folders.insert(0, root);
+                self.recent_folders.truncate(10);
                 self.save_config();
                 self.status(format!("Opened {}", self.cwd().display()));
             }
             Err(e) => self.status(format!("Cannot open folder: {e}")),
+        }
+    }
+
+    /// File > Open Folder… — native OS chooser (Finder / GTK / KDE via
+    /// zenity/kdialog, WinForms). Falls back to the path-entry dialog
+    /// (which itself has a Browse… button) when no picker exists.
+    /// Cancelling the native dialog does nothing, like VS Code.
+    pub fn pick_and_open_folder(&mut self) {
+        use crate::file_dialog::PickOutcome;
+        match crate::file_dialog::pick_folder(Some(&self.cwd())) {
+            PickOutcome::Picked(p) => self.open_folder(&p),
+            PickOutcome::Cancelled => {}
+            PickOutcome::Unavailable => {
+                self.open_folder_input = self.cwd().to_string_lossy().into_owned();
+                self.show_open_folder = true;
+            }
+        }
+    }
+
+    pub fn pick_and_open_file(&mut self) {
+        use crate::file_dialog::PickOutcome;
+        match crate::file_dialog::pick_file(Some(&self.cwd())) {
+            PickOutcome::Picked(p) => self.open_file(&p),
+            PickOutcome::Cancelled => {}
+            PickOutcome::Unavailable => {
+                self.status("No native file picker found (install zenity or kdialog)".into());
+            }
+        }
+    }
+
+    /// Save As… — native save dialog, copies the buffer to the new path.
+    pub fn save_as_active(&mut self) {
+        use crate::file_dialog::PickOutcome;
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+        let name = active
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled.txt".into());
+        let dir = active.parent().map(|p| p.to_path_buf());
+        match crate::file_dialog::pick_save_file(dir.as_deref(), &name) {
+            PickOutcome::Picked(target) => {
+                // Flush the editor into the buffer, then write to target.
+                if self.editor_for.as_ref() == Some(&active) {
+                    if let Some(ws) = self.workspace.as_mut() {
+                        if let Some(buf) = ws.get_mut(&active) {
+                            buf.set_text(&self.editor_text.clone());
+                        }
+                    }
+                }
+                let text = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| w.get(&active))
+                    .map(|b| b.text());
+                match text {
+                    Some(text) => match std::fs::write(&target, text) {
+                        Ok(()) => {
+                            self.status(format!("Saved as {}", target.display()));
+                            self.open_file(&target);
+                        }
+                        Err(e) => self.status(format!("Save As failed: {e}")),
+                    },
+                    None => self.status("Save As: no editable buffer".into()),
+                }
+            }
+            PickOutcome::Cancelled => {}
+            PickOutcome::Unavailable => {
+                self.status("No native save dialog found (install zenity or kdialog)".into())
+            }
+        }
+    }
+
+    /// Revert File — reload the active file from disk, dropping unsaved edits.
+    pub fn revert_active_file(&mut self) {
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+        match std::fs::read_to_string(&active) {
+            Ok(text) => {
+                if let Some(ws) = self.workspace.as_mut() {
+                    if let Some(buf) = ws.get_mut(&active) {
+                        buf.set_text(&text);
+                        buf.mark_saved();
+                    }
+                }
+                if self.active.as_ref() == Some(&active) {
+                    self.editor_text = text;
+                    self.editor_for = Some(active);
+                }
+                self.status("File reverted".into());
+            }
+            Err(e) => self.status(format!("Revert failed: {e}")),
+        }
+    }
+
+    /// Close Folder (Ctrl+K F) — VS Code returns to the empty window.
+    pub fn close_folder(&mut self) {
+        if self
+            .workspace
+            .as_ref()
+            .is_some_and(|w| !w.dirty_paths().is_empty())
+        {
+            self.unsaved_action = Some(UnsavedAction::CloseFolder);
+            return;
+        }
+        self.finish_close_folder();
+    }
+
+    fn finish_close_folder(&mut self) {
+        self.workspace = None;
+        self.tabs.clear();
+        self.active = None;
+        self.editor_for = None;
+        self.editor_text.clear();
+        self.git.snapshot = None;
+        self.git_diff = None;
+        self.expanded_dirs.clear();
+        self.status("Folder closed".into());
+    }
+
+    /// New Window / Duplicate Workspace — spawn a fresh process.
+    pub fn new_window(&mut self, folder: Option<PathBuf>) {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oxide-code"));
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(f) = folder {
+            cmd.arg(f);
+        }
+        match cmd.spawn() {
+            Ok(_) => self.status("Opened new window".into()),
+            Err(e) => self.status(format!("New Window failed: {e}")),
+        }
+    }
+
+    /// Save Workspace As… — writes a `.code-workspace` JSON file.
+    pub fn save_workspace_as(&mut self) {
+        use crate::file_dialog::PickOutcome;
+        let root = self.cwd();
+        let name = format!(
+            "{}.code-workspace",
+            root.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "workspace".into())
+        );
+        match crate::file_dialog::pick_save_file(Some(&root), &name) {
+            PickOutcome::Picked(target) => {
+                let body = serde_json::json!({
+                    "folders": [{ "path": root.to_string_lossy() }],
+                    "settings": {}
+                });
+                match std::fs::write(
+                    &target,
+                    serde_json::to_string_pretty(&body).unwrap_or_default(),
+                ) {
+                    Ok(()) => self.status(format!("Workspace saved to {}", target.display())),
+                    Err(e) => self.status(format!("Save Workspace failed: {e}")),
+                }
+            }
+            PickOutcome::Cancelled => {}
+            PickOutcome::Unavailable => self.status("No native save dialog found".into()),
+        }
+    }
+
+    /// Reload every open buffer from disk (after Discard All / stash / pull…).
+    pub fn reload_all_buffers(&mut self) {
+        let tabs = self.tabs.clone();
+        for path in tabs {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Some(ws) = self.workspace.as_mut() {
+                    if let Some(buf) = ws.get_mut(&path) {
+                        buf.set_text(&text);
+                        buf.mark_saved();
+                    }
+                }
+                if self.active.as_ref() == Some(&path) {
+                    self.editor_text = text;
+                    self.editor_for = Some(path);
+                }
+            }
         }
     }
 
@@ -801,6 +1030,7 @@ impl OxideApp {
                 }
             }
             UnsavedAction::OpenFolder(path) => self.open_folder_unchecked(&path),
+            UnsavedAction::CloseFolder => self.finish_close_folder(),
             UnsavedAction::Quit => {
                 self.quit_confirmed = true;
                 self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1025,6 +1255,7 @@ impl OxideApp {
     /// are ignored). Buffers are snapshotted so unsaved edits count.
     pub fn run_search(&mut self) {
         let Some(ws) = &self.workspace else { return };
+        self.search_error = None;
         self.search_gen += 1;
         let gen = self.search_gen;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1159,6 +1390,16 @@ impl OxideApp {
             }
         }
         self.extension_theme = cfg.extension_theme;
+        if let Some(v) = cfg.auto_save {
+            self.auto_save = v;
+        }
+        self.recent_folders = cfg
+            .recent_folders
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .take(10)
+            .collect();
         if let Some(folder) = cfg.last_folder {
             self.open_folder_input = folder;
         }
@@ -1182,6 +1423,12 @@ impl OxideApp {
             check_on_save: Some(self.check_on_save),
             minimap_enabled: Some(self.minimap_enabled),
             gitlens_blame: Some(self.gitlens_blame),
+            recent_folders: self
+                .recent_folders
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            auto_save: Some(self.auto_save),
         };
         if let Ok(text) = serde_json::to_string_pretty(&cfg) {
             let _ = std::fs::write(path, text);
@@ -1286,6 +1533,23 @@ impl OxideApp {
             self.bottom_open = !self.bottom_open;
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Backslash)) {
             self.split_open = !self.split_open;
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
+            self.pick_and_open_file();
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S)) {
+            self.save_as_active();
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::N)) {
+            self.new_window(None);
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
+            if self
+                .workspace
+                .as_ref()
+                .is_some_and(|w| !w.dirty_paths().is_empty())
+            {
+                self.unsaved_action = Some(UnsavedAction::Quit);
+            } else {
+                self.quit_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
             self.save_active();
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W)) {
@@ -1330,7 +1594,16 @@ const PALETTE_ITEMS: &[(&str, &str, &str)] = &[
     ("File", "New File…", "Ctrl+N"),
     ("File", "New Folder…", ""),
     ("File", "New Rust Project…", ""),
-    ("File", "Open Folder…", ""),
+    ("File", "Open File…", "Ctrl+O"),
+    ("File", "Open Folder…", "Ctrl+K Ctrl+O"),
+    ("File", "Save As…", "Ctrl+Shift+S"),
+    ("Git", "Git: Stash Changes…", ""),
+    ("Git", "Git: Fetch", ""),
+    ("Git", "Git: Pull", ""),
+    ("Git", "Git: Push", ""),
+    ("Git", "Git: Sync", ""),
+    ("Git", "Git: Create Branch…", ""),
+    ("Git", "Git: Undo Last Commit", ""),
     ("Cargo", "Cargo: Check", "Ctrl+Shift+B"),
     ("Cargo", "Cargo: Build", ""),
     ("Cargo", "Cargo: Run", ""),
@@ -1463,10 +1736,44 @@ impl OxideApp {
                 self.new_proj_name.clear();
                 self.show_new_project = true;
             }
-            "Open Folder…" => {
-                self.open_folder_input = self.cwd().to_string_lossy().into_owned();
-                self.show_open_folder = true;
+            "Open Folder…" => self.pick_and_open_folder(),
+            "Open File…" => self.pick_and_open_file(),
+            "Save As…" => self.save_as_active(),
+            "Git: Stash Changes…" => {
+                self.stash_input.clear();
+                self.show_stash_dialog = true;
+                self.activity = Activity::Git;
+                self.sidebar_open = true;
             }
+            "Git: Fetch" => {
+                if let Some(s) = &self.git.snapshot {
+                    let r = s.root.clone();
+                    self.git.fetch(&r);
+                }
+            }
+            "Git: Pull" => {
+                if let Some(s) = &self.git.snapshot {
+                    let r = s.root.clone();
+                    self.git.pull(&r);
+                }
+            }
+            "Git: Push" => {
+                if let Some(s) = &self.git.snapshot {
+                    let r = s.root.clone();
+                    self.git.push(&r);
+                }
+            }
+            "Git: Sync" => {
+                if let Some(s) = &self.git.snapshot {
+                    let r = s.root.clone();
+                    self.git.sync(&r);
+                }
+            }
+            "Git: Create Branch…" => {
+                self.branch_input.clear();
+                self.show_branch_dialog = true;
+            }
+            "Git: Undo Last Commit" => self.confirm_git = Some(GitConfirm::UndoCommit),
             _ => {}
         }
         self.palette_open = false;
@@ -1501,9 +1808,10 @@ impl OxideApp {
                         egui::CornerRadius::same(4);
                     ui.style_mut().spacing.item_spacing.x = 2.0;
 
-                    // Menus
+                    // Menus — File mirrors the VS Code File menu (screenshot).
                     ui.menu_button("File", |ui| {
                         menu_style_accent(ui, &theme);
+                        ui.set_min_width(280.0);
                         if menu_item(ui, "New Text File", "Ctrl+N").clicked() {
                             let dir = self.explorer_target_dir();
                             self.explorer_edit = Some(ExplorerEdit {
@@ -1511,8 +1819,32 @@ impl OxideApp {
                                 target: dir,
                                 text: String::new(),
                             });
+                            self.activity = Activity::Explorer;
+                            self.sidebar_open = true;
                             ui.close();
                         }
+                        if menu_item(ui, "New File…", "Ctrl+Alt+N").clicked() {
+                            let dir = self.explorer_target_dir();
+                            self.explorer_edit = Some(ExplorerEdit {
+                                kind: ExplorerEditKind::NewFile,
+                                target: dir,
+                                text: String::new(),
+                            });
+                            self.activity = Activity::Explorer;
+                            self.sidebar_open = true;
+                            ui.close();
+                        }
+                        if menu_item(ui, "New Window", "Ctrl+Shift+N").clicked() {
+                            self.new_window(None);
+                            ui.close();
+                        }
+                        ui.menu_button("New Window with Profile", |ui| {
+                            menu_style_accent(ui, &theme);
+                            if menu_item(ui, "Default Profile", "").clicked() {
+                                self.new_window(None);
+                                ui.close();
+                            }
+                        });
                         if menu_item(ui, "New Folder…", "").clicked() {
                             let dir = self.explorer_target_dir();
                             self.explorer_edit = Some(ExplorerEdit {
@@ -1528,18 +1860,177 @@ impl OxideApp {
                             ui.close();
                         }
                         ui.separator();
-                        if menu_item(ui, "Open Folder…", "").clicked() {
-                            self.open_folder_input = self.cwd().to_string_lossy().into_owned();
-                            self.show_open_folder = true;
+                        if menu_item(ui, "Open File…", "Ctrl+O").clicked() {
+                            self.pick_and_open_file();
+                            ui.close();
+                        }
+                        if menu_item(ui, "Open Folder…", "Ctrl+K Ctrl+O").clicked() {
+                            self.pick_and_open_folder();
+                            ui.close();
+                        }
+                        if menu_item(ui, "Open Workspace from File…", "").clicked() {
+                            self.pick_and_open_file();
+                            ui.close();
+                        }
+                        ui.menu_button("Open Recent", |ui| {
+                            menu_style_accent(ui, &theme);
+                            ui.set_min_width(280.0);
+                            if self.recent_folders.is_empty() {
+                                ui.add_enabled(false, egui::Button::new("(no recent folders)"));
+                            }
+                            let recents = self.recent_folders.clone();
+                            for p in recents {
+                                if menu_item(ui, &p.to_string_lossy(), "").clicked() {
+                                    self.open_folder(&p);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if menu_item(ui, "Clear Recently Opened", "").clicked() {
+                                self.recent_folders.clear();
+                                self.save_config();
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        if menu_item(ui, "Add Folder to Workspace…", "").clicked() {
+                            self.pick_and_open_folder();
+                            ui.close();
+                        }
+                        if menu_item(ui, "Save Workspace As…", "").clicked() {
+                            self.save_workspace_as();
+                            ui.close();
+                        }
+                        if menu_item(ui, "Duplicate Workspace", "").clicked() {
+                            let cwd = self.cwd();
+                            self.new_window(Some(cwd));
                             ui.close();
                         }
                         ui.separator();
-                        if menu_item(ui, "Save", "Ctrl+S").clicked() {
-                            self.save_active();
-                            ui.close();
-                        }
+                        let has_active = self.active.is_some();
+                        ui.add_enabled_ui(has_active, |ui| {
+                            if menu_item(ui, "Save", "Ctrl+S").clicked() {
+                                self.save_active();
+                                ui.close();
+                            }
+                        });
+                        ui.add_enabled_ui(has_active, |ui| {
+                            if menu_item(ui, "Save As…", "Ctrl+Shift+S").clicked() {
+                                self.save_as_active();
+                                ui.close();
+                            }
+                        });
                         if menu_item(ui, "Save All", "").clicked() {
                             self.save_all();
+                            ui.close();
+                        }
+                        ui.separator();
+                        ui.menu_button("Share", |ui| {
+                            menu_style_accent(ui, &theme);
+                            if menu_item(ui, "Copy Workspace Path", "").clicked() {
+                                ui.ctx()
+                                    .copy_text(self.cwd().to_string_lossy().into_owned());
+                                ui.close();
+                            }
+                            if let Some(active) = self.active.clone() {
+                                if menu_item(ui, "Copy File Path", "").clicked() {
+                                    ui.ctx().copy_text(active.to_string_lossy().into_owned());
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.menu_button("Auto Save", |ui| {
+                            menu_style_accent(ui, &theme);
+                            if ui.selectable_label(!self.auto_save, "Off").clicked() {
+                                self.auto_save = false;
+                                self.save_config();
+                                ui.close();
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.auto_save,
+                                    "On (save dirty buffers when the editor loses focus)",
+                                )
+                                .clicked()
+                            {
+                                self.auto_save = true;
+                                self.save_config();
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("Preferences", |ui| {
+                            menu_style_accent(ui, &theme);
+                            if menu_item(ui, "Settings", "Ctrl+,").clicked() {
+                                self.activity = Activity::Settings;
+                                self.sidebar_open = true;
+                                ui.close();
+                            }
+                            ui.menu_button("Color Theme", |ui| {
+                                menu_style_accent(ui, &theme);
+                                for (name, kind) in ThemeKind::all() {
+                                    if ui
+                                        .selectable_label(
+                                            self.extension_theme.is_none()
+                                                && self.theme_kind == *kind,
+                                            *name,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.select_theme(*kind);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if menu_item(ui, "Toggle Minimap", "").clicked() {
+                                self.minimap_enabled = !self.minimap_enabled;
+                                self.save_config();
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        ui.add_enabled_ui(has_active, |ui| {
+                            if menu_item(ui, "Revert File", "").clicked() {
+                                self.revert_active_file();
+                                ui.close();
+                            }
+                        });
+                        ui.add_enabled_ui(has_active, |ui| {
+                            if menu_item(ui, "Close Editor", "Ctrl+W").clicked() {
+                                if let Some(a) = self.active.clone() {
+                                    self.close_tab(&a);
+                                }
+                                ui.close();
+                            }
+                        });
+                        if menu_item(ui, "Close Folder", "Ctrl+K F").clicked() {
+                            self.close_folder();
+                            ui.close();
+                        }
+                        if menu_item(ui, "Close Window", "Alt+F4").clicked() {
+                            if self
+                                .workspace
+                                .as_ref()
+                                .is_some_and(|w| !w.dirty_paths().is_empty())
+                            {
+                                self.unsaved_action = Some(UnsavedAction::Quit);
+                            } else {
+                                self.quit_confirmed = true;
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            ui.close();
+                        }
+                        ui.separator();
+                        if menu_item(ui, "Exit", "Ctrl+Q").clicked() {
+                            if self
+                                .workspace
+                                .as_ref()
+                                .is_some_and(|w| !w.dirty_paths().is_empty())
+                            {
+                                self.unsaved_action = Some(UnsavedAction::Quit);
+                            } else {
+                                self.quit_confirmed = true;
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
                             ui.close();
                         }
                     });
@@ -2287,12 +2778,39 @@ impl OxideApp {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
+                .default_width(520.0)
                 .show(ctx, |ui| {
-                    ui.label("Folder path:");
-                    ui.text_edit_singleline(&mut self.open_folder_input);
+                    ui.label("Select a folder to open:");
+                    ui.add_space(4.0);
+                    if primary_button(ui, "Browse… (native folder chooser)", &theme).clicked() {
+                        self.show_open_folder = false;
+                        self.pick_and_open_folder();
+                        return;
+                    }
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Recent folders")
+                            .color(theme.dim)
+                            .size(11.0),
+                    );
+                    let recents = self.recent_folders.clone();
+                    for p in recents.iter().take(6) {
+                        if ui.button(p.to_string_lossy().as_ref()).clicked() {
+                            let p = p.clone();
+                            self.show_open_folder = false;
+                            self.open_folder(&p);
+                            return;
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.label("Or type / paste a folder path:");
+                    let resp = ui.text_edit_singleline(&mut self.open_folder_input);
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if primary_button(ui, "Open", &theme).clicked() {
+                        if primary_button(ui, "Open", &theme).clicked() || enter {
                             let p = PathBuf::from(self.open_folder_input.trim());
                             self.show_open_folder = false;
                             self.open_folder(&p);
@@ -2301,9 +2819,203 @@ impl OxideApp {
                             self.show_open_folder = false;
                         }
                     });
+                    if !crate::file_dialog::native_available() {
+                        ui.label(
+                            egui::RichText::new(
+                                "Tip: install zenity or kdialog for the native chooser.",
+                            )
+                            .color(theme.dim)
+                            .size(11.0),
+                        );
+                    }
                 });
             if !open {
                 self.show_open_folder = false;
+            }
+        }
+
+        // Stash dialog (VS Code: Stash Changes…)
+        if self.show_stash_dialog {
+            let mut open = true;
+            egui::Window::new("Stash Changes")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    ui.label("Stash message (optional):");
+                    ui.text_edit_singleline(&mut self.stash_input);
+                    ui.checkbox(&mut self.stash_include_untracked, "Include untracked files");
+                    ui.checkbox(
+                        &mut self.stash_keep_index,
+                        "Keep staged changes in the working tree (--keep-index)",
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, "Stash", &theme).clicked() {
+                            if let Some(snap) = &self.git.snapshot {
+                                let root = snap.root.clone();
+                                let msg = if self.stash_input.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(self.stash_input.clone())
+                                };
+                                self.git.stash_push(
+                                    &root,
+                                    msg,
+                                    self.stash_include_untracked,
+                                    self.stash_keep_index,
+                                    vec![],
+                                );
+                            }
+                            self.show_stash_dialog = false;
+                        }
+                        if secondary_button(ui, "Cancel", &theme).clicked() {
+                            self.show_stash_dialog = false;
+                        }
+                    });
+                });
+            if !open {
+                self.show_stash_dialog = false;
+            }
+        }
+
+        // Create Branch dialog (VS Code: Create Branch…)
+        if self.show_branch_dialog {
+            let mut open = true;
+            egui::Window::new("Create Branch")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    ui.label("New branch name:");
+                    let resp = ui.text_edit_singleline(&mut self.branch_input);
+                    resp.request_focus();
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if (primary_button(ui, "Create and Checkout", &theme).clicked() || enter)
+                            && !self.branch_input.trim().is_empty()
+                        {
+                            if let Some(snap) = &self.git.snapshot {
+                                let root = snap.root.clone();
+                                self.git.create_branch(
+                                    &root,
+                                    self.branch_input.trim().to_string(),
+                                    true,
+                                );
+                            }
+                            self.show_branch_dialog = false;
+                        }
+                        if secondary_button(ui, "Cancel", &theme).clicked() {
+                            self.show_branch_dialog = false;
+                        }
+                    });
+                });
+            if !open {
+                self.show_branch_dialog = false;
+            }
+        }
+
+        // Git confirmations (discard all / clean / drop stash / delete branch / undo)
+        if let Some(confirm) = self.confirm_git.clone() {
+            use GitConfirm as G;
+            let (title, body) = match &confirm {
+                G::DiscardAll => (
+                    "Discard All Changes",
+                    "Discard all staged and unstaged tracked changes? Untracked files are kept."
+                        .to_string(),
+                ),
+                G::DiscardAllTracked => (
+                    "Discard All Tracked Changes",
+                    "Discard all unstaged tracked changes? Staged changes are kept.".to_string(),
+                ),
+                G::CleanAll => (
+                    "Clean All Untracked Files",
+                    "Permanently delete all untracked files? This cannot be undone.".to_string(),
+                ),
+                G::DiscardStaged(p) => (
+                    "Discard Staged Changes",
+                    format!("Discard staged + worktree changes to '{}'?", p.display()),
+                ),
+                G::Clean(p) => (
+                    "Clean Untracked File",
+                    format!("Permanently delete untracked file '{}'?", p.display()),
+                ),
+                G::DropStash(i) => (
+                    "Drop Stash",
+                    format!("Drop stash@{{{i}}}? This cannot be undone."),
+                ),
+                G::DeleteBranch(b) => ("Delete Branch", format!("Delete branch '{b}'?")),
+                G::UndoCommit => (
+                    "Undo Last Commit",
+                    "Undo the last commit? Changes stay staged (--soft).".to_string(),
+                ),
+            };
+            let mut open = true;
+            egui::Window::new(title)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(body);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, "Confirm", &theme).clicked() {
+                            if let Some(snap) = self.git.snapshot.clone() {
+                                let root = snap.root.clone();
+                                match &confirm {
+                                    G::DiscardAll => {
+                                        // Tracked only: restore worktree + unstage tracked.
+                                        let paths: Vec<PathBuf> = snap
+                                            .entries
+                                            .iter()
+                                            .filter(|e| !e.is_untracked())
+                                            .flat_map(|e| {
+                                                let mut v = vec![e.path.clone()];
+                                                if let Some(o) = &e.original_path {
+                                                    v.push(o.clone());
+                                                }
+                                                v
+                                            })
+                                            .collect();
+                                        self.git.unstage(&root, paths.clone(), snap.has_head);
+                                        self.git.discard_all(&root, paths);
+                                    }
+                                    G::DiscardAllTracked => {
+                                        let paths: Vec<PathBuf> = snap
+                                            .changed()
+                                            .filter(|e| !e.is_untracked())
+                                            .map(|e| e.path.clone())
+                                            .collect();
+                                        self.git.discard_all(&root, paths);
+                                    }
+                                    G::CleanAll => {
+                                        let paths: Vec<PathBuf> =
+                                            snap.untracked().map(|e| e.path.clone()).collect();
+                                        self.git.clean(&root, paths);
+                                    }
+                                    G::DiscardStaged(p) => {
+                                        self.git.discard_staged(&root, p.clone(), snap.has_head)
+                                    }
+                                    G::Clean(p) => self.git.clean(&root, vec![p.clone()]),
+                                    G::DropStash(i) => self.git.stash_drop(&root, *i),
+                                    G::DeleteBranch(b) => {
+                                        self.git.delete_branch(&root, b.clone(), false)
+                                    }
+                                    G::UndoCommit => self.git.undo_commit(&root),
+                                }
+                            }
+                            self.confirm_git = None;
+                        }
+                        if secondary_button(ui, "Cancel", &theme).clicked() {
+                            self.confirm_git = None;
+                        }
+                    });
+                });
+            if !open {
+                self.confirm_git = None;
             }
         }
 
@@ -2803,7 +3515,37 @@ impl eframe::App for OxideApp {
                                     }
                                 }
                             }
-                            _ => {}
+                            // Anything that rewrites the worktree/index
+                            // outside the editor: resync all open buffers.
+                            ActionKind::DiscardAll
+                            | ActionKind::DiscardStaged { .. }
+                            | ActionKind::Clean { .. }
+                            | ActionKind::CleanAll
+                            | ActionKind::StashPush
+                            | ActionKind::StashApply { .. }
+                            | ActionKind::Pull
+                            | ActionKind::Sync
+                            | ActionKind::Checkout { .. }
+                            | ActionKind::MergeBranch { .. }
+                            | ActionKind::UndoCommit => {
+                                if !message.is_empty() {
+                                    self.status(message.clone());
+                                }
+                                self.reload_all_buffers();
+                            }
+                            _ => {
+                                if !message.is_empty()
+                                    && matches!(
+                                        kind,
+                                        ActionKind::Fetch
+                                            | ActionKind::Push
+                                            | ActionKind::Publish
+                                            | ActionKind::CreateBranch { .. }
+                                    )
+                                {
+                                    self.status(message.clone());
+                                }
+                            }
                         }
                     }
                     if let Some(ws) = &self.workspace {

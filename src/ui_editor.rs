@@ -208,10 +208,7 @@ fn watermark_click(app: &mut OxideApp, label: &str) {
             app.bottom_tab = crate::app::BottomTab::Terminal;
             app.pty.ensure_session();
         }
-        "Open Folder…" => {
-            app.open_folder_input = app.cwd().to_string_lossy().into_owned();
-            app.show_open_folder = true;
-        }
+        "Open Folder…" => app.pick_and_open_folder(),
         _ => {}
     }
 }
@@ -640,6 +637,10 @@ fn show_editor(app: &mut OxideApp, ctx: &egui::Context, ui: &mut egui::Ui) {
                 buf.set_text(&app.editor_text);
             }
         }
+    }
+    // Auto Save (File > Auto Save): write the buffer when editing loses focus.
+    if app.auto_save && output.response.lost_focus() {
+        app.save_active();
     }
     if let Some(range) = output.state.cursor.char_range() {
         let offset = range.primary.index;

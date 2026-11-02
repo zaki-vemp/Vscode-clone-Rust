@@ -127,6 +127,8 @@ pub struct SearchMatch {
     pub line: usize,
     pub column: usize,
     pub preview: String,
+    /// Byte range of this match in the trimmed preview, for UI highlighting.
+    pub preview_match: Range<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,12 +196,45 @@ pub fn search_text(path: &Path, text: &str, m: &Matcher, budget: &mut usize) -> 
             .find('\n')
             .map(|i| r.end + i)
             .unwrap_or(text.len());
-        let preview = text[line_start..line_end].trim().to_string();
+        let raw_preview = &text[line_start..line_end];
+        let leading = raw_preview.len() - raw_preview.trim_start().len();
+        let trimmed = raw_preview.trim();
+        let highlighted = r
+            .start
+            .saturating_sub(line_start + leading)
+            .min(trimmed.len())
+            ..r.end
+                .saturating_sub(line_start + leading)
+                .min(trimmed.len());
+        // A minified line can match thousands of times. Keep bounded context
+        // around each hit rather than duplicating the whole line for each one.
+        let start = trimmed[..highlighted.start]
+            .char_indices()
+            .rev()
+            .nth(40)
+            .map_or(0, |(index, _)| index);
+        let end = trimmed[start..]
+            .char_indices()
+            .nth(240)
+            .map_or(trimmed.len(), |(index, _)| start + index);
+        let mut preview = String::new();
+        if start > 0 {
+            preview.push('…');
+        }
+        let prefix = preview.len();
+        preview.push_str(&trimmed[start..end]);
+        let preview_match =
+            (highlighted.start - start + prefix)..(highlighted.end.min(end) - start + prefix);
+        if end < trimmed.len() {
+            preview.push('…');
+        }
+        let preview = preview.replace(['\r', '\n', '\t'], " ");
         matches.push(SearchMatch {
             range: r,
             line,
             column,
             preview,
+            preview_match,
         });
     }
     (!matches.is_empty()).then(|| SearchFile {
@@ -443,6 +478,34 @@ mod tests {
             query: q.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn preview_highlight_preserves_unicode_offsets_and_trimmed_whitespace() {
+        let matcher = Matcher::new(&opts("世界")).unwrap();
+        let mut budget = 10;
+        let file = search_text(
+            Path::new("example.rs"),
+            "    let greeting = \"世界\";  \n",
+            &matcher,
+            &mut budget,
+        )
+        .unwrap();
+        let found = &file.matches[0];
+        assert_eq!(&found.preview[found.preview_match.clone()], "世界");
+        assert_eq!(found.preview, "let greeting = \"世界\";");
+    }
+
+    #[test]
+    fn minified_search_result_previews_have_bounded_context() {
+        let matcher = Matcher::new(&opts("世界")).unwrap();
+        let source = format!("{}世界{}", "ä".repeat(50_000), "é".repeat(50_000));
+        let file = search_text(Path::new("minified.json"), &source, &matcher, &mut 10).unwrap();
+        let found = &file.matches[0];
+        assert!(found.preview.chars().count() <= 242);
+        assert_eq!(&found.preview[found.preview_match.clone()], "世界");
+        assert!(found.preview.starts_with('…') && found.preview.ends_with('…'));
+        assert_eq!(&file.text[found.range.clone()], "世界");
     }
 
     #[test]
